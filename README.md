@@ -1,18 +1,17 @@
 # PYTHON
 import os
 import json
-from openai import OpenAI
+import requests
 from datetime import datetime, date
 from dotenv import load_dotenv
 
 # Load the variables from the .env file
-load_dotenv()  # <-- Add this line before creating the client
+load_dotenv()
 
-# Initialize the OpenRouter client using the OpenAI SDK
-client = OpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=os.environ.get("OPENROUTER_API_KEY"),
-)
+# We no longer initialize an OpenAI client. 
+# Instead, we define the API URL and our API Key.
+API_URL = "https://openrouter.ai/api/v1/chat/completions"
+API_KEY = os.environ.get("OPENROUTER_API_KEY")
 
 # ---------------------------------------------------------
 # 1. Tools
@@ -42,7 +41,7 @@ available_tools = {
     'calculate': calculate,
 }
 
-# OpenRouter / OpenAI requires explicit JSON schemas for tools
+# OpenRouter requires explicit JSON schemas for tools
 tool_schemas = [
     {
         "type": "function",
@@ -82,32 +81,43 @@ tool_schemas = [
 # ---------------------------------------------------------
 
 def agent(user_input: str, chat_history: list) -> str:
-    """Sends the user input to OpenRouter and handles any necessary tool calls."""
+    """Sends the user input to OpenRouter via direct HTTP request and handles tool calls."""
     
     # Append the user's message to the conversation history
     chat_history.append({'role': 'user', 'content': user_input})
 
-    # Call the model via OpenRouter
-    response = client.chat.completions.create(
-        model='openrouter/free', # Standard OpenRouter model ID
-        messages=chat_history,
-        tools=tool_schemas
-    )
+    # Prepare the headers and payload for the HTTP POST request
+    headers = {
+        "Authorization": f"Bearer {API_KEY}",
+        "Content-Type": "application/json"
+    }
+    
+    payload = {
+        "model": "openrouter/free",
+        "messages": chat_history,
+        "tools": tool_schemas
+    }
 
-    message = response.choices[0].message
+    # First API Call
+    response = requests.post(API_URL, headers=headers, json=payload)
+    response.raise_for_status() # Throw an error if the request fails
+    
+    # Parse the JSON response into a Python dictionary
+    response_data = response.json()
+    message = response_data['choices'][0]['message']
 
     # Check if the LLM decided it needs to use a tool
-    if message.tool_calls:
-        # Append the LLM's tool request to the history
+    if 'tool_calls' in message and message['tool_calls']:
+        # Append the LLM's tool request dictionary to the history
         chat_history.append(message)
         
         # Iterate over all the tools the LLM asked to run
-        for tool_call in message.tool_calls:
-            tool_name = tool_call.function.name
+        for tool_call in message['tool_calls']:
+            tool_name = tool_call['function']['name']
             
-            # OpenRouter returns arguments as a JSON string, so we must parse it
+            # Arguments come back as a JSON string, so we must parse it
             try:
-                tool_args = json.loads(tool_call.function.arguments)
+                tool_args = json.loads(tool_call['function']['arguments'])
             except json.JSONDecodeError:
                 tool_args = {}
 
@@ -117,40 +127,43 @@ def agent(user_input: str, chat_history: list) -> str:
                 tool_output = tool_function(**tool_args)
                 
                 # Append the result of the tool back to the chat history
-                # Notice we MUST include the tool_call_id for OpenAI/OpenRouter
                 chat_history.append({
                     'role': 'tool',
-                    'tool_call_id': tool_call.id,
+                    'tool_call_id': tool_call['id'],
                     'name': tool_name,
                     'content': str(tool_output)
                 })
             else:
                 chat_history.append({
                     'role': 'tool',
-                    'tool_call_id': tool_call.id,
+                    'tool_call_id': tool_call['id'],
                     'name': tool_name,
                     'content': "Error: Tool not found."
                 })
 
-        # Send the chat history (now containing the tool's answer) back to the LLM
-        final_response = client.chat.completions.create(
-            model='openrouter/free', 
-            messages=chat_history
-        )
-        final_message = final_response.choices[0].message
-        chat_history.append(final_message)
-        return final_message.content
+        # Update payload with the new chat history (containing tool results)
+        payload["messages"] = chat_history
 
-    # If no tools were called, just return the standard conversational response
+        # Second API Call
+        final_response = requests.post(API_URL, headers=headers, json=payload)
+        final_response.raise_for_status()
+        
+        final_data = final_response.json()
+        final_message = final_data['choices'][0]['message']
+        
+        chat_history.append(final_message)
+        return final_message.get('content', '')
+
+    # If no tools were called, append and return the standard response
     chat_history.append(message)
-    return message.content
+    return message.get('content', '')
 
 # ---------------------------------------------------------
 # 3. Run Loop
 # ---------------------------------------------------------
 
 def run_agent():
-    print("🤖 OpenRouter Agent Started (type 'exit' or 'bye' to quit)\n")
+    print("🤖 Raw HTTP Agent Started (type 'exit' or 'bye' to quit)\n")
     
     # System prompt to give the agent its persona
     messages = [
