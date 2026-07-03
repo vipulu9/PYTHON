@@ -1,506 +1,13 @@
-main.py mcp
-from mcp.server.fastmcp import FastMCP
-import os
-import requests
-import urllib3
-
-from dotenv import load_dotenv
-from typing import Any, Optional
-
-load_dotenv()
-
-urllib3.disable_warnings()
-
-mcp = FastMCP("ServiceNow CRUD Server", host="0.0.0.0", stateless_http=True)
-
-INSTANCE = os.getenv("SERVICENOW_INSTANCE")
-USERNAME = os.getenv("SERVICENOW_USERNAME")
-PASSWORD = os.getenv("SERVICENOW_PASSWORD")
-
-BASE_URL = f"https://{INSTANCE}/api/now/table/incident"
-
-_BASE_HEADERS = {
-    "Content-Type": "application/json",
-    "Accept": "application/json",
-}
-
-
-def _get_session() -> tuple[str, requests.Session]:
-    """Build an authenticated requests.Session and return (base_url, session)."""
-    if not INSTANCE:
-        raise RuntimeError(
-            "SNOW_INSTANCE environment variable is not set. "
-            "Set it to your ServiceNow hostname, e.g. dev12345.service-now.com"
-        )
-
-    base_url = f"https://{INSTANCE}/api/now"
-    session = requests.Session()
-    session.headers.update(_BASE_HEADERS)
-
-    client_id = os.environ.get("SNOW_CLIENT_ID")
-    client_secret = os.environ.get("SNOW_CLIENT_SECRET")
-
-    if client_id and client_secret:
-        # OAuth 2.0 – client_credentials grant
-        token_url = f"https://{INSTANCE}/oauth_token.do"
-        resp = requests.post(
-            token_url,
-            data={
-                "grant_type": "client_credentials",
-                "client_id": client_id,
-                "client_secret": client_secret,
-            },
-            timeout=15,
-        )
-        resp.raise_for_status()
-        token = resp.json()["access_token"]
-        session.headers["Authorization"] = f"Bearer {token}"
-    else:
-        username = USERNAME
-        password = PASSWORD
-        if not username or not password:
-            raise RuntimeError(
-                "Set either (SNOW_CLIENT_ID + SNOW_CLIENT_SECRET) for OAuth "
-                "or (SNOW_USERNAME + SNOW_PASSWORD) for basic auth."
-            )
-        session.auth = (username, password)
-
-    return base_url, session
-
-
-def _table_url(base_url: str, table: str, sys_id: str = "") -> str:
-    path = f"{base_url}/table/{table}"
-    return f"{path}/{sys_id}" if sys_id else path
-
-
-def _check(resp: requests.Response) -> dict[str, Any]:
-    resp.raise_for_status()
-    return resp.json()
-
-
-def get_auth():
-    return (USERNAME, PASSWORD)
-
-
-# =====================================================
-# CREATE
-# =====================================================
-
-
-@mcp.tool()
-def create_incident(short_description: str, description: Optional[str] = None):
-    """
-    Create a ServiceNow Incident.
-    """
-
-    payload = {"short_description": short_description}
-
-    if description:
-        payload["description"] = description
-
-    response = requests.post(BASE_URL, auth=get_auth(), json=payload, verify=False)
-
-    response.raise_for_status()
-
-    return response.json()
-
-
-# =====================================================
-# READ
-# =====================================================
-
-
-@mcp.tool()
-def get_incident(incident_number: str):
-    """
-    Fetch incident by number.
-    Example: INC0010001
-    """
-
-    params = {
-        "sysparm_query": f"number={incident_number}",
-        "sysparm_limit": 1,
-        "sysparm_display_value": "true",
-    }
-
-    response = requests.get(BASE_URL, auth=get_auth(), params=params, verify=False)
-
-    response.raise_for_status()
-
-    data = response.json()
-
-    if not data["result"]:
-        return {"success": False, "message": "Incident not found"}
-
-    return data["result"][0]
-
-
-# =====================================================
-# UPDATE
-# =====================================================
-
-
-@mcp.tool()
-def update_incident(
-    incident_number: str, state: Optional[int] = None, work_notes: Optional[str] = None
-):
-    """
-    Update incident.
-
-    State values:
-        1 = New
-        2 = In Progress
-        3 = On Hold
-        6 = Resolved
-        7 = Closed
-    """
-
-    incident = get_incident(incident_number)
-
-    if not incident.get("sys_id"):
-        return {"success": False, "message": "Incident not found"}
-
-    payload = {}
-
-    if state:
-        payload["state"] = state
-
-    if work_notes:
-        payload["work_notes"] = work_notes
-
-    response = requests.patch(
-        f"{BASE_URL}/{incident['sys_id']}", auth=get_auth(), json=payload, verify=False
-    )
-
-    response.raise_for_status()
-
-    return response.json()
-
-
-# =====================================================
-# DELETE
-# =====================================================
-
-
-@mcp.tool()
-def delete_incident(incident_number: str):
-    """
-    Delete incident by number.
-    """
-
-    incident = get_incident(incident_number)
-
-    if not incident.get("sys_id"):
-        return {"success": False, "message": "Incident not found"}
-
-    response = requests.delete(
-        f"{BASE_URL}/{incident['sys_id']}", auth=get_auth(), verify=False
-    )
-
-    response.raise_for_status()
-
-    return {"success": True, "message": f"{incident_number} deleted"}
-
-
-
-@mcp.tool()
-def search_incidents(
-    query: str,
-    state: Optional[str] = None,
-    priority: Optional[str] = None,
-    assigned_to: Optional[str] = None,
-    limit: int = 10,
-) -> list[dict[str, Any]]:
-    """
-    Search ServiceNow incidents using an encoded query string.
-
-    Args:
-        query:       Free-text or encoded query, e.g. "short_descriptionLIKEnetwork outage".
-        state:       Filter by state code: 1=New, 2=In Progress, 3=On Hold,
-                     4=Resolved, 5=Closed, 6=Cancelled.
-        priority:    Filter by priority: 1=Critical, 2=High, 3=Moderate, 4=Low, 5=Planning.
-        assigned_to: Username of the assignee to filter on.
-        limit:       Maximum number of results to return (default 10, max 100).
-    """
-    base_url, session = _get_session()
-    parts = [query] if query else []
-    if state:
-        parts.append(f"state={state}")
-    if priority:
-        parts.append(f"priority={priority}")
-    if assigned_to:
-        parts.append(f"assigned_to.user_name={assigned_to}")
-
-    encoded = "^".join(parts) if parts else "active=true"
-    resp = session.get(
-        _table_url(base_url, "incident"),
-        params={
-            "sysparm_query": encoded,
-            "sysparm_limit": min(limit, 100),
-            "sysparm_fields": (
-            "number,short_description,description,"
-            "work_notes,comments,close_notes,"
-            "state,priority,assigned_to,"
-            "opened_at,resolved_at,caller_id,category,sys_id"
-        ),
-        },
-        timeout=15,
-    )
-    return _check(resp).get("result", [])
-
-
-# =====================================================
-# RESOURCE
-# =====================================================
-
-@mcp.resource("servicenow://status")
-def status():
-    return "ServiceNow CRUD MCP Running"
-
-
-PORT = int(os.getenv("PORT", "8000"))
-
-if __name__ == "__main__":
-    mcp.run(transport="streamable-http")
-
-
-# if __name__ == "__main__":
-#     mcp.run(transport="streamable-http")
-
-
-main.py analyzer
-import os
-import logging
-from pydantic import BaseModel, Field
-from dotenv import load_dotenv
-
-from mcp_client.client import build_tools_from_mcp
-from strands import Agent, tool
-from strands.multiagent.a2a.executor import StrandsA2AExecutor
-from strands.multiagent.a2a import A2AServer
-from bedrock_agentcore.runtime import serve_a2a
-from model.load import load_model
-from strands_tools.retrieve import retrieve as _kb_retrieve_fn
-
-# Load variables from local .env file
-load_dotenv()
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-
-SYSTEM_PROMPT = """
-You are a ServiceNow incident search assistant.
-
-The user provides a natural-language incident description.
-
-Your task is to:
-1. FIRST search for existing incidents
-2. THEN optionally enrich results using the knowledge base
-
----
-
-### Allowed Actions
-
-- You MUST first use the incident search/query tool
-- AFTER retrieving incidents, you MAY use the knowledge base search tool to get additional context
-
----
-
-### STRICTLY FORBIDDEN
-
-- DO NOT create incidents
-- DO NOT update incidents
-- DO NOT call any tool other than:
-  - incident search tool (PRIMARY)
-  - knowledge base search tool (SECONDARY)
-- NEVER use create_incident under any circumstance
-
----
-
-### Query Rules (Incident Search - FIRST)
-
-1. Use the user input directly
-
-2. Construct a single query using:
-   short_descriptionLIKE<user_description>
-
-3. DO NOT:
-   - Split into keywords
-   - Use multiple LIKE conditions
-   - Use OR (^OR)
-   - Modify the user input
-
----
-
-### Knowledge Base Usage (SECOND STEP)
-
-- After retrieving incidents:
-  - Extract key terms (e.g., issue type, keywords, error)
-  - Use those terms to call the knowledge base search tool
-
-- Use KB ONLY to supplement / add context
-- Do NOT replace incident search with KB search
-
----
-
-### Retrieval Rules
-
-- Incident search result = PRIMARY output
-- KB search result = OPTIONAL enrichment
-
-You MAY:
-- Append KB insights below incident results
-
-You MUST NOT:
-- Modify original incident data
-- Filter results
-- Rank results
-- Remove fields
-- Change structure
-
----
-
-### Output Format
-
-1. Return incident search results EXACTLY as returned
-2. OPTIONAL: append KB results under a section like:
-
---- Knowledge Base Insights ---
-<kb_response>
-
----
-
-### Behavior Guarantee
-
-You are a READ-ONLY agent.
-You NEVER perform write actions on ServiceNow.
-
-Execution order is STRICT:
-1 → Incident Search  
-2 → Knowledge Base (optional)
-
-If unsure → always perform incident search first.
-"""
-
-
-@tool
-def knowledge_base_search(query: str) -> str:
-    """Search the Bedrock knowledge base for incidents or information. Use this for any knowledge base lookups.
-
-    Args:
-        query: The incident ID or search text to find in the knowledge base (e.g. INC000036152332, fibercut)
-
-    Returns:
-        Relevant content from the knowledge base matching the query
-    """
-    kb_id = os.getenv("KNOWLEDGE_BASE_ID")
-    region = os.getenv("AWS_REGION", "us-east-1")
-
-    if not kb_id:
-        return "Error: KNOWLEDGE_BASE_ID not configured"
-
-    tool_input = {
-        'toolUseId': 'kb-search',
-        'input': {
-            'text': query,
-            'knowledgeBaseId': kb_id,
-            'region': region,
-            'numberOfResults': 5,
-            'score': 0.35
-        }
-    }
-
-    try:
-        response = _kb_retrieve_fn(tool_input)
-        status = response.get('status', 'error')
-        content = response.get('content', [])
-
-        if status != 'success' or not content:
-            return f"No results found for: {query}"
-
-        return content[0].get('text', f"No results found for: {query}")
-
-    except Exception as e:
-        return f"Search error: {str(e)}"
-
-
-
-# ========================================================
-#  RUNTIME AND ROUTING UTILITY
-# ========================================================
-def main():
-    # Looks for LOCAL_TESTING=true in your .env file
-    is_local = os.getenv("ENV", "prod").lower() == "local"
-    
-    tools = build_tools_from_mcp()
-    print(tools)
-    analyzer_agent = Agent(
-        name="Analyzer Agent",    
-        description="Provides insight on incident data.",  
-        model=load_model(),
-        system_prompt=SYSTEM_PROMPT,
-        tools=[tools, knowledge_base_search],
-    )
-
-
-    if is_local:
-        logger.info("Running in LOCAL mode via A2AServer on port 9002...")
-        # Local server constructor accepts exactly 'agent_factory'
-        a2a_server = A2AServer(
-            agent=analyzer_agent, 
-            port=9002
-        )
-        a2a_server.serve()
-    else:
-        logger.info("Running in AWS PRODUCTION environment via Bedrock AgentCore Runtime...")
-        # Production StrandsA2AExecutor wrapper class matches the parameter name 'agent_factory'
-        executor = StrandsA2AExecutor(agent=analyzer_agent)
-        serve_a2a(executor)
-
-if __name__ == "__main__":
-    main()
-
-
 client.py
-# import os
-# import logging
-# from mcp.client.streamable_http  import streamablehttp_client
-# from strands.tools.mcp.mcp_client import MCPClient
-# from urllib.parse import quote
-# logger = logging.getLogger(__name__)
-
-
-# SNOW_MCP_ARN = quote('arn:aws:bedrock-agentcore:ap-south-1:224198986708:runtime/serviceNowMcp_snowMCP-O4syQJ7QHk', safe='')
-
-# MCP_ENDPOINT = os.getenv(
-#     "MCP_ENDPOINT",
-#     f"https://bedrock-agentcore.ap-south-1.amazonaws.com/runtimes/{SNOW_MCP_ARN}/invocations/"
-# )
-
-# def get_streamable_http_mcp_client() -> MCPClient: 
-#     """Returns an MCP Client compatible with Strands"""
-#     # to use an MCP server that supports bearer authentication, add headers={"Authorization": f"Bearer {access_token}"}
-    
-#     try:
-#         response = streamablehttp_client(MCP_ENDPOINT)
-#         if response is None:
-#             logger.warning("MCP client could not connect to the endpoint: %s", MCP_ENDPOINT)
-#             return None
-#     except Exception as e:
-#         logger.error("Error while creating MCP client: %s", e)
-#         return None
-    
-#     return MCPClient(lambda: streamablehttp_client(MCP_ENDPOINT))
-
-
-
 import boto3
 import json
-from botocore.exceptions import ClientError
-
-from strands.tools import tool
 import logging
+from botocore.exceptions import ClientError
+from strands.tools import tool
+
+# --- OTel Tracing Imports ---
+from opentelemetry.propagate import inject
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -511,18 +18,20 @@ runtime_arn = 'arn:aws:bedrock-agentcore:us-east-1:224198986708:runtime/serviceN
 
 def call_mcp(method, params=None):
     """
-    Call an MCP method on the agent runtime.
-    
-    Args:
-        method: The MCP method to call (e.g., 'tools/list', 'tools/call')
-        params: Optional parameters for the method
-    
-    Returns:
-        The result from the MCP response
+    Call an MCP method on the agent runtime and inject trace context.
     """
     logger.info(f"MCP METHOD CALLED: {method}")
     if params is None:
         params = {}
+
+    # --- Trace Propagation Fix ---
+    # Extract active trace context and inject it safely into the tool arguments
+    trace_context = {}
+    inject(trace_context)
+
+    if method == "tools/call" and "arguments" in params:
+        params["arguments"]["_trace_context"] = trace_context
+    # -----------------------------
 
     payload = json.dumps({
         "jsonrpc": "2.0",
@@ -554,7 +63,6 @@ def call_mcp(method, params=None):
         print(json.dumps(json_data, indent=2))
         print("=======================\n")
         
-        # ✅ handle all cases
         if "result" in json_data:
             return json_data["result"]
         
@@ -563,10 +71,6 @@ def call_mcp(method, params=None):
         
         else:
             raise Exception(f"Unexpected MCP response format: {json_data}")
-    
-
-
-        return json_data['result']
 
     except ClientError as e:
         print(f"\n{'=' * 60}")
@@ -575,9 +79,6 @@ def call_mcp(method, params=None):
         print(f"{'=' * 60}\n")
         raise
 
-
-from strands.tools import tool
-import json
 
 def build_tools_from_mcp():
     tools_response = call_mcp("tools/list")
@@ -592,7 +93,6 @@ def build_tools_from_mcp():
             @tool(name=tool_name)
             def dynamic_tool(**kwargs):
                 logger.info(f"TOOL EXECUTED: {tool_name}")
-                # ✅ FIX: unwrap kwargs properly
                 if "kwargs" in kwargs:
                     try:
                         parsed = kwargs["kwargs"]
@@ -615,3 +115,220 @@ def build_tools_from_mcp():
         strands_tools.append(make_tool(name))
 
     return strands_tools
+
+
+main.py mcp 
+from mcp.server.fastmcp import FastMCP
+import os
+import requests
+import urllib3
+from dotenv import load_dotenv
+from typing import Any, Optional
+
+# --- OTel Tracing Imports ---
+from opentelemetry import trace
+from opentelemetry.propagate import extract
+from opentelemetry.context import attach, detach
+from contextlib import contextmanager
+
+load_dotenv()
+urllib3.disable_warnings()
+
+mcp = FastMCP("ServiceNow CRUD Server", host="0.0.0.0", stateless_http=True)
+tracer = trace.get_tracer(__name__)
+
+INSTANCE = os.getenv("SERVICENOW_INSTANCE")
+USERNAME = os.getenv("SERVICENOW_USERNAME")
+PASSWORD = os.getenv("SERVICENOW_PASSWORD")
+BASE_URL = f"https://{INSTANCE}/api/now/table/incident"
+
+_BASE_HEADERS = {
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+}
+
+@contextmanager
+def trace_propagation(kwargs: dict, span_name: str):
+    """Extracts injected trace context and links it to the active trace."""
+    trace_ctx = kwargs.get("_trace_context")
+    token = None
+    if trace_ctx:
+        ctx = extract(trace_ctx)
+        token = attach(ctx)
+    try:
+        with tracer.start_as_current_span(span_name):
+            yield
+    finally:
+        if token is not None:
+            detach(token)
+
+def _get_session() -> tuple[str, requests.Session]:
+    if not INSTANCE:
+        raise RuntimeError("SNOW_INSTANCE environment variable is not set.")
+    base_url = f"https://{INSTANCE}/api/now"
+    session = requests.Session()
+    session.headers.update(_BASE_HEADERS)
+
+    client_id = os.environ.get("SNOW_CLIENT_ID")
+    client_secret = os.environ.get("SNOW_CLIENT_SECRET")
+
+    if client_id and client_secret:
+        token_url = f"https://{INSTANCE}/oauth_token.do"
+        resp = requests.post(
+            token_url,
+            data={
+                "grant_type": "client_credentials",
+                "client_id": client_id,
+                "client_secret": client_secret,
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        token = resp.json()["access_token"]
+        session.headers["Authorization"] = f"Bearer {token}"
+    else:
+        username = USERNAME
+        password = PASSWORD
+        if not username or not password:
+            raise RuntimeError("Set credentials for basic auth or OAuth.")
+        session.auth = (username, password)
+    return base_url, session
+
+def _table_url(base_url: str, table: str, sys_id: str = "") -> str:
+    path = f"{base_url}/table/{table}"
+    return f"{path}/{sys_id}" if sys_id else path
+
+def _check(resp: requests.Response) -> dict[str, Any]:
+    resp.raise_for_status()
+    return resp.json()
+
+def get_auth():
+    return (USERNAME, PASSWORD)
+
+# =====================================================
+# CREATE
+# =====================================================
+
+@mcp.tool()
+def create_incident(short_description: str, description: Optional[str] = None, **kwargs):
+    with trace_propagation(kwargs, "create_incident"):
+        payload = {"short_description": short_description}
+        if description:
+            payload["description"] = description
+        response = requests.post(BASE_URL, auth=get_auth(), json=payload, verify=False)
+        response.raise_for_status()
+        return response.json()
+
+# =====================================================
+# READ
+# =====================================================
+
+@mcp.tool()
+def get_incident(incident_number: str, **kwargs):
+    with trace_propagation(kwargs, "get_incident"):
+        params = {
+            "sysparm_query": f"number={incident_number}",
+            "sysparm_limit": 1,
+            "sysparm_display_value": "true",
+        }
+        response = requests.get(BASE_URL, auth=get_auth(), params=params, verify=False)
+        response.raise_for_status()
+        data = response.json()
+        if not data["result"]:
+            return {"success": False, "message": "Incident not found"}
+        return data["result"][0]
+
+# =====================================================
+# UPDATE
+# =====================================================
+
+@mcp.tool()
+def update_incident(
+    incident_number: str, state: Optional[int] = None, work_notes: Optional[str] = None, **kwargs
+):
+    with trace_propagation(kwargs, "update_incident"):
+        incident = get_incident(incident_number)
+        if not incident.get("sys_id"):
+            return {"success": False, "message": "Incident not found"}
+        
+        payload = {}
+        if state:
+            payload["state"] = state
+        if work_notes:
+            payload["work_notes"] = work_notes
+
+        response = requests.patch(
+            f"{BASE_URL}/{incident['sys_id']}", auth=get_auth(), json=payload, verify=False
+        )
+        response.raise_for_status()
+        return response.json()
+
+# =====================================================
+# DELETE
+# =====================================================
+
+@mcp.tool()
+def delete_incident(incident_number: str, **kwargs):
+    with trace_propagation(kwargs, "delete_incident"):
+        incident = get_incident(incident_number)
+        if not incident.get("sys_id"):
+            return {"success": False, "message": "Incident not found"}
+            
+        response = requests.delete(
+            f"{BASE_URL}/{incident['sys_id']}", auth=get_auth(), verify=False
+        )
+        response.raise_for_status()
+        return {"success": True, "message": f"{incident_number} deleted"}
+
+# =====================================================
+# SEARCH
+# =====================================================
+
+@mcp.tool()
+def search_incidents(
+    query: str,
+    state: Optional[str] = None,
+    priority: Optional[str] = None,
+    assigned_to: Optional[str] = None,
+    limit: int = 10,
+    **kwargs
+) -> list[dict[str, Any]]:
+    with trace_propagation(kwargs, "search_incidents"):
+        base_url, session = _get_session()
+        parts = [query] if query else []
+        if state:
+            parts.append(f"state={state}")
+        if priority:
+            parts.append(f"priority={priority}")
+        if assigned_to:
+            parts.append(f"assigned_to.user_name={assigned_to}")
+
+        encoded = "^".join(parts) if parts else "active=true"
+        resp = session.get(
+            _table_url(base_url, "incident"),
+            params={
+                "sysparm_query": encoded,
+                "sysparm_limit": min(limit, 100),
+                "sysparm_fields": (
+                "number,short_description,description,"
+                "work_notes,comments,close_notes,"
+                "state,priority,assigned_to,"
+                "opened_at,resolved_at,caller_id,category,sys_id"
+            ),
+            },
+            timeout=15,
+        )
+        return _check(resp).get("result", [])
+
+# =====================================================
+# RESOURCE
+# =====================================================
+
+@mcp.resource("servicenow://status")
+def status():
+    return "ServiceNow CRUD MCP Running"
+
+PORT = int(os.getenv("PORT", "8000"))
+
+if __name__ == "__main__":
+    mcp.run(transport="streamable-http")
