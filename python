@@ -17,7 +17,6 @@ from bedrock_agentcore.runtime import serve_a2a
 from strands.agent.a2a_agent import A2AAgent
 from urllib.parse import quote
 from dotenv import load_dotenv
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -28,24 +27,7 @@ AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 AWS_ANALYZER_ARN = os.getenv("AWS_ANALYZER_ARN", "")
 AWS_SUMMARIZER_ARN = os.getenv("AWS_SUMMARIZER_ARN", "")
 AWS_PROMPT_ID = os.getenv("AWS_PROMPT_ID", "")
-AWS_PROMPT_VERSION = os.getenv("AWS_PROMPT_VERSION", "")  # Optional: defaults to DRAFT if blank
-
-# AWS Sessions and Clients
-aws_session = boto3.Session(region_name=AWS_REGION)
-bedrock_agent_client = aws_session.client('bedrock-agent')
-
-is_local = os.getenv("ENV", "prod").lower() == "local"
-use_arn = os.getenv("USE_ARN", "true").lower() == "true"
-escaped_analyzer_arn = quote(AWS_ANALYZER_ARN, safe='')
-escaped_summarizer_arn = quote(AWS_SUMMARIZER_ARN, safe='')
-
-analyzer_endpoint = f"https://bedrock-agentcore.{AWS_REGION}.amazonaws.com/runtimes/{escaped_analyzer_arn}/invocations/"
-summarizer_endpoint = f"https://bedrock-agentcore.{AWS_REGION}.amazonaws.com/runtimes/{escaped_summarizer_arn}/invocations/"
-
-logger.info(f"Analyzer ARN: {AWS_ANALYZER_ARN}")
-logger.info(f"Summarizer ARN: {AWS_SUMMARIZER_ARN}")
-logger.info(f"Analyzer Endpoint: {analyzer_endpoint}")
-logger.info(f"Summarizer Endpoint: {summarizer_endpoint}")
+AWS_PROMPT_VERSION = os.getenv("AWS_PROMPT_VERSION", "DRAFT")
 
 
 class SigV4HTTPXAuth(httpx.Auth):
@@ -74,6 +56,24 @@ class SigV4HTTPXAuth(httpx.Auth):
 
         yield request
 
+
+
+aws_session = boto3.Session(region_name=AWS_REGION)
+bedrock_agent_client = aws_session.client('bedrock-agent')
+
+is_local = os.getenv("ENV", "prod").lower() == "local"
+use_arn = os.getenv("USE_ARN", "true").lower() == "true"
+# Fixed the URL endpoint syntax to use the correct regional Bedrock AgentCore runtime domain
+escaped_analyzer_arn = quote(AWS_ANALYZER_ARN, safe='')
+escaped_summarizer_arn = quote(AWS_SUMMARIZER_ARN, safe='')
+
+analyzer_endpoint = f"https://bedrock-agentcore.{AWS_REGION}.amazonaws.com/runtimes/{escaped_analyzer_arn}/invocations/"
+summarizer_endpoint = f"https://bedrock-agentcore.{AWS_REGION}.amazonaws.com/runtimes/{escaped_summarizer_arn}/invocations/"
+
+print(f"Analyzer ARN: {AWS_ANALYZER_ARN}")
+print(f"Summarizer ARN: {AWS_SUMMARIZER_ARN}")
+print(f"Analyzer Endpoint: {analyzer_endpoint}")
+print(f"Summarizer Endpoint: {summarizer_endpoint}")
 
 def build_incident_graph():
     """Create a fresh graph per invocation to avoid cross-event-loop client reuse."""
@@ -122,12 +122,48 @@ def execute_incident_analysis_pipeline(incident_details: str) -> str:
     """
     compiled_incident_graph = build_incident_graph()
     result = compiled_incident_graph(incident_details)
-    logger.info("Pipeline execution completed.")
+    print(result)
     return result
 
 # ========================================================
-#  5. BEDROCK PROMPT MANAGEMENT & MASTER AGENT SETUP
+#  5. DEFINE THE MASTER ORCHESTRATOR INTERFACE AGENT
 # ========================================================
+
+def get_fallback_prompt() -> str:
+    """Returns the original hardcoded prompt as a fallback mechanism."""
+    return """
+You are an expert incident orchestration agent responsible for coordinating a multi-stage analysis pipeline.
+
+You will receive inputs that may include:
+- Incident ID
+- Incident description
+- Logs, alerts, or error messages
+- Additional diagnostic context
+
+Your responsibilities:
+1. Understand the full incident context, including any identifiers (e.g., incident ID) and descriptions.
+2. Treat every request as a candidate for pipeline execution when it relates to incidents, failures, or diagnostics.
+3. Always delegate processing to the execution pipeline tool for analysis and summarization.
+4. Ensure the final output is structured, actionable, and useful for engineers.
+
+Strict rules:
+- DO NOT perform analysis or summarization yourself.
+- ALWAYS invoke the pipeline tool for incident-related inputs.
+- Preserve all input information, including incident IDs and metadata, when passing to the tool.
+- Do NOT ask follow-up questions — forward incomplete inputs as-is.
+- Do NOT modify, filter, or reinterpret logs.
+
+Output expectations:
+- Return ONLY the pipeline result.
+- The output should typically include:
+  - Incident ID (if provided)
+  - Key findings
+  - Root cause (if identified)
+  - Recommended actions or next steps
+- Do not add extra commentary outside the pipeline output.
+
+You act strictly as an orchestrator, not as an analyzer.
+"""
 
 def get_bedrock_system_prompt(prompt_id: str, prompt_version: str, **variables) -> str:
     """
@@ -135,73 +171,49 @@ def get_bedrock_system_prompt(prompt_id: str, prompt_version: str, **variables) 
     Requires Bedrock prompt variables to be formatted as {{variable_name}}.
     """
     if not prompt_id:
-        logger.warning("AWS_PROMPT_ID is empty or not set. Falling back to the hardcoded default prompt.")
+        logger.warning("AWS_PROMPT_ID is not set in environment. Going for fallback prompt.")
         return get_fallback_prompt()
 
     try:
-        logger.info(f"Attempting to fetch Bedrock Prompt [ID: {prompt_id}, Version: {prompt_version or 'DRAFT'}]...")
+        logger.info(f"Attempting to fetch prompt from Bedrock (ID: {prompt_id}, Version: {prompt_version})")
         
-        # Set up the API arguments
-        kwargs = {'promptIdentifier': prompt_id}
-        if prompt_version:
-            kwargs['promptVersion'] = prompt_version
-
-        # Fetch from Bedrock
-        response = bedrock_agent_client.get_prompt(**kwargs)
+        response = bedrock_agent_client.get_prompt(
+            promptIdentifier=prompt_id,
+            promptVersion=prompt_version
+        )
         
-        # Traverse the Bedrock response structure to extract the prompt text
         variants = response.get("variants", [])
         if not variants:
-            logger.error(f"No variants found in the Bedrock prompt response for ID {prompt_id}. Using fallback prompt.")
+            logger.error(f"No variants found for prompt {prompt_id}. Going for fallback prompt.")
             return get_fallback_prompt()
             
         template_config = variants[0].get("templateConfiguration", {})
         prompt_text = template_config.get("text", {}).get("text", "")
 
         if not prompt_text:
-            logger.error(f"Prompt text is empty in the Bedrock response for ID {prompt_id}. Using fallback prompt.")
+            logger.error(f"Prompt text is empty in the response. Going for fallback prompt.")
             return get_fallback_prompt()
 
         # Inject dynamic variables
         for key, value in variables.items():
             prompt_text = prompt_text.replace(f"{{{{{key}}}}}", str(value))
             
-        logger.info(f"SUCCESS: Successfully fetched and configured Bedrock prompt '{prompt_id}'.")
-        # Print a small preview of the prompt to confirm variable injection in the logs
-        logger.info(f"Configured Prompt Preview: {prompt_text[:100]}...") 
-        
+        logger.info(f"Successfully fetched and injected variables for Bedrock prompt '{prompt_id}'")
         return prompt_text
 
-    except bedrock_agent_client.exceptions.AccessDeniedException as e:
-        logger.error(f"Access Denied fetching Bedrock Prompt. Verify IAM permissions and ensure you are using the 10-character Prompt ID (not the prompt name). Error: {e}")
-        logger.info("Using the hardcoded fallback prompt due to AccessDeniedException.")
-        return get_fallback_prompt()
     except Exception as e:
-        logger.error(f"Unexpected error fetching prompt from Bedrock: {e}")
-        logger.info("Using the hardcoded fallback prompt due to an unexpected error.")
+        logger.error(f"Failed to fetch prompt from Bedrock due to error: {e}. Going for fallback prompt.")
         return get_fallback_prompt()
 
 
-def get_fallback_prompt() -> str:
-    """Provides a safe fallback if Bedrock fetch fails or ID is missing."""
-    return """
-    You are an expert incident orchestration agent responsible for coordinating a multi-stage analysis pipeline.
-    Your responsibilities:
-    1. Understand the full incident context.
-    2. ALWAYS delegate processing to the execution pipeline tool.
-    Strict rules:
-    - DO NOT perform analysis yourself.
-    - Return ONLY the pipeline result.
-    """
-
-# Define the dynamic variables you want to inject into the Bedrock prompt
+# Define dynamic variables based on environment and constants
 dynamic_prompt_variables = {
     "environment": os.getenv("ENV", "prod").upper(),
     "target_audience": "L3 Support Engineers",
     "timeout_seconds": str(DEFAULT_TIMEOUT)
 }
 
-# Fetch the active system prompt dynamically at initialization
+# Dynamically set the system prompt
 SYSTEM_PROMPT = get_bedrock_system_prompt(
     prompt_id=AWS_PROMPT_ID,
     prompt_version=AWS_PROMPT_VERSION,
@@ -215,8 +227,8 @@ orchestrator_agent = Agent(
     tools=[execute_incident_analysis_pipeline]
 )
 
-
 def main():
+
     if is_local:
         logger.info("Running Master orchestrator in LOCAL mode via Strands A2AServer on port 9001...")
         a2a_server = A2AServer(
