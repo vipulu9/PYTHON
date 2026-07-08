@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 from botocore.auth import SigV4Auth
 from botocore.awsrequest import AWSRequest
 from a2a.client import ClientConfig
+from opentelemetry import trace, propagate
 
 from strands import Agent
 from strands.multiagent import GraphBuilder
@@ -26,9 +27,8 @@ DEFAULT_TIMEOUT = 300  # 5 minutes
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 AWS_ANALYZER_ARN = os.getenv("AWS_ANALYZER_ARN", "")
 AWS_SUMMARIZER_ARN = os.getenv("AWS_SUMMARIZER_ARN", "")
-AWS_PROMPT_ID = os.getenv("AWS_PROMPT_ID", "")
-AWS_PROMPT_VERSION = os.getenv("AWS_PROMPT_VERSION", "DRAFT")
-
+AWS_PROMPT_ID = os.getenv("AWS_PROMPT_ID", "arn:aws:bedrock:us-east-1:224198986708:prompt/SZDHHZ2T26:3")
+AWS_PROMPT_VERSION = os.getenv("AWS_PROMPT_VERSION", "3")
 
 class SigV4HTTPXAuth(httpx.Auth):
     """HTTPX Auth class that signs requests with AWS SigV4."""
@@ -120,8 +120,15 @@ def execute_incident_analysis_pipeline(incident_details: str) -> str:
     Invokes the internal multi-agent graph pipeline to route incident logs 
     sequentially through remote AWS cloud nodes and return a structured summary.
     """
+    logger.info("Received incident details for processing. Invoking multi-agent analysis pipeline...")
+    current_span = trace.get_current_span()
+    span_context = current_span.get_span_context()
+    trace_id = format(span_context.trace_id, "032x")
+    logger.info("Processing request. trace_id=%s", trace_id)
+
     compiled_incident_graph = build_incident_graph()
-    result = compiled_incident_graph(incident_details)
+    payload = incident_details
+    result = compiled_incident_graph(payload)
     print(result)
     return result
 
@@ -197,8 +204,10 @@ def get_bedrock_system_prompt(prompt_id: str, prompt_version: str, **variables) 
         # Inject dynamic variables
         for key, value in variables.items():
             prompt_text = prompt_text.replace(f"{{{{{key}}}}}", str(value))
-            
-        logger.info(f"Successfully fetched and injected variables for Bedrock prompt '{prompt_id}'")
+
+        logger.info(f"Successfully fetched prompt from Bedrock prompt management '{prompt_text}")
+        logger.info(f"Successfully fetched prompt from Bedrock prompt management '{prompt_id}'")    
+        # logger.info(f"Successfully fetched prompt and injected variables for Bedrock prompt '{prompt_id}'")
         return prompt_text
 
     except Exception as e:
@@ -208,7 +217,7 @@ def get_bedrock_system_prompt(prompt_id: str, prompt_version: str, **variables) 
 
 # Define dynamic variables based on environment and constants
 dynamic_prompt_variables = {
-    "environment": os.getenv("ENV", "prod").upper(),
+    "environment":  "prod",
     "target_audience": "L3 Support Engineers",
     "timeout_seconds": str(DEFAULT_TIMEOUT)
 }
@@ -220,11 +229,13 @@ SYSTEM_PROMPT = get_bedrock_system_prompt(
     **dynamic_prompt_variables
 )
 
+
+
 orchestrator_agent = Agent(
     name="IncidentOrchestrator",
     description="Orchestrates the incident analysis pipeline and returns structured insights.",
     system_prompt=SYSTEM_PROMPT,
-    tools=[execute_incident_analysis_pipeline]
+    tools=[execute_incident_analysis_pipeline],
 )
 
 def main():
