@@ -1,6 +1,7 @@
 import os
 import logging
 import asyncio
+import time
 import boto3
 import httpx
 from pydantic import BaseModel, Field
@@ -136,42 +137,6 @@ def execute_incident_analysis_pipeline(incident_details: str) -> str:
 #  5. DEFINE THE MASTER ORCHESTRATOR INTERFACE AGENT
 # ========================================================
 
-def get_fallback_prompt() -> str:
-    """Returns the original hardcoded prompt as a fallback mechanism."""
-    return """
-You are an expert incident orchestration agent responsible for coordinating a multi-stage analysis pipeline.
-
-You will receive inputs that may include:
-- Incident ID
-- Incident description
-- Logs, alerts, or error messages
-- Additional diagnostic context
-
-Your responsibilities:
-1. Understand the full incident context, including any identifiers (e.g., incident ID) and descriptions.
-2. Treat every request as a candidate for pipeline execution when it relates to incidents, failures, or diagnostics.
-3. Always delegate processing to the execution pipeline tool for analysis and summarization.
-4. Ensure the final output is structured, actionable, and useful for engineers.
-
-Strict rules:
-- DO NOT perform analysis or summarization yourself.
-- ALWAYS invoke the pipeline tool for incident-related inputs.
-- Preserve all input information, including incident IDs and metadata, when passing to the tool.
-- Do NOT ask follow-up questions — forward incomplete inputs as-is.
-- Do NOT modify, filter, or reinterpret logs.
-
-Output expectations:
-- Return ONLY the pipeline result.
-- The output should typically include:
-  - Incident ID (if provided)
-  - Key findings
-  - Root cause (if identified)
-  - Recommended actions or next steps
-- Do not add extra commentary outside the pipeline output.
-
-You act strictly as an orchestrator, not as an analyzer.
-"""
-
 def get_bedrock_system_prompt(prompt_id: str, prompt_version: str, **variables) -> str:
     """
     Fetches the system prompt from AWS Bedrock Prompt Management and injects dynamic variables.
@@ -179,40 +144,45 @@ def get_bedrock_system_prompt(prompt_id: str, prompt_version: str, **variables) 
     """
     if not prompt_id:
         logger.warning("AWS_PROMPT_ID is not set in environment. Going for fallback prompt.")
-        return get_fallback_prompt()
+        return ""
 
-    try:
-        logger.info(f"Attempting to fetch prompt from Bedrock (ID: {prompt_id}, Version: {prompt_version})")
-        
-        response = bedrock_agent_client.get_prompt(
-            promptIdentifier=prompt_id,
-            promptVersion=prompt_version
-        )
-        
-        variants = response.get("variants", [])
-        if not variants:
-            logger.error(f"No variants found for prompt {prompt_id}. Going for fallback prompt.")
-            return get_fallback_prompt()
+    max_retries = 3
+    for attempt in range(1, max_retries + 1):
+        try:
+            logger.info(f"Attempting to fetch prompt from Bedrock (ID: {prompt_id}, Version: {prompt_version}) - Try {attempt}")
             
-        template_config = variants[0].get("templateConfiguration", {})
-        prompt_text = template_config.get("text", {}).get("text", "")
+            response = bedrock_agent_client.get_prompt(
+                promptIdentifier=prompt_id,
+                promptVersion=prompt_version
+            )
+            
+            variants = response.get("variants", [])
+            if not variants:
+                logger.error(f"No variants found for prompt {prompt_id}. Going for fallback prompt.")
+                return ""
+                
+            template_config = variants[0].get("templateConfiguration", {})
+            prompt_text = template_config.get("text", {}).get("text", "")
 
-        if not prompt_text:
-            logger.error(f"Prompt text is empty in the response. Going for fallback prompt.")
-            return get_fallback_prompt()
+            if not prompt_text:
+                logger.error(f"Prompt text is empty in the response. Going for fallback prompt.")
+                return ""
 
-        # Inject dynamic variables
-        for key, value in variables.items():
-            prompt_text = prompt_text.replace(f"{{{{{key}}}}}", str(value))
+            # Inject dynamic variables
+            for key, value in variables.items():
+                prompt_text = prompt_text.replace(f"{{{{{key}}}}}", str(value))
 
-        logger.info(f"Successfully fetched prompt from Bedrock prompt management '{prompt_text}")
-        logger.info(f"Successfully fetched prompt from Bedrock prompt management '{prompt_id}'")    
-        # logger.info(f"Successfully fetched prompt and injected variables for Bedrock prompt '{prompt_id}'")
-        return prompt_text
+            logger.info(f"Successfully fetched prompt from Bedrock prompt management '{prompt_text}")
+            logger.info(f"Successfully fetched prompt from Bedrock prompt management '{prompt_id}'")    
+            return prompt_text
 
-    except Exception as e:
-        logger.error(f"Failed to fetch prompt from Bedrock due to error: {e}. Going for fallback prompt.")
-        return get_fallback_prompt()
+        except Exception as e:
+            if attempt < max_retries:
+                logger.warning(f"Attempt {attempt} failed due to error: {e}. Retrying in 2 seconds...")
+                time.sleep(2)
+            else:
+                logger.error(f"Failed to fetch prompt from Bedrock due to error: {e}. Going for fallback prompt.")
+                return ""
 
 
 # Define dynamic variables based on environment and constants
