@@ -144,6 +144,7 @@ def get_bedrock_system_prompt(prompt_id: str, prompt_version: str, **variables) 
     """
     if not prompt_id:
         logger.warning("AWS_PROMPT_ID is not set in environment. Going for fallback prompt.")
+        # raise ValueError("cannot initialize agent without a prompt ID configuration")
         return ""
 
     max_retries = 3
@@ -156,6 +157,7 @@ def get_bedrock_system_prompt(prompt_id: str, prompt_version: str, **variables) 
                 promptVersion=prompt_version
             )
             
+            #logger.info(f"response: {response}")
             variants = response.get("variants", [])
             if not variants:
                 logger.error(f"No variants found for prompt {prompt_id}. Going for fallback prompt.")
