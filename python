@@ -27,8 +27,8 @@ DEFAULT_TIMEOUT = 300  # 5 minutes
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 AWS_ANALYZER_ARN = os.getenv("AWS_ANALYZER_ARN", "")
 AWS_SUMMARIZER_ARN = os.getenv("AWS_SUMMARIZER_ARN", "")
-AWS_PROMPT_ID = os.getenv("AWS_PROMPT_ID", "arn:aws:bedrock:us-east-1:224198986708:prompt/SZDHHZ2T26:3")
-AWS_PROMPT_VERSION = os.getenv("AWS_PROMPT_VERSION", "3")
+AWS_PROMPT_ID = os.getenv("AWS_PROMPT_ID", "")
+AWS_PROMPT_VERSION = os.getenv("AWS_PROMPT_VERSION", "")
 
 class SigV4HTTPXAuth(httpx.Auth):
     """HTTPX Auth class that signs requests with AWS SigV4."""
@@ -136,9 +136,9 @@ def execute_incident_analysis_pipeline(incident_details: str) -> str:
 #  5. DEFINE THE MASTER ORCHESTRATOR INTERFACE AGENT
 # ========================================================
 
-def get_fallback_configuration() -> dict:
-    """Returns the original hardcoded prompt and default model settings as a fallback."""
-    fallback_text = """
+def get_fallback_prompt() -> str:
+    """Returns the original hardcoded prompt as a fallback mechanism."""
+    return """
 You are an expert incident orchestration agent responsible for coordinating a multi-stage analysis pipeline.
 
 You will receive inputs that may include:
@@ -171,22 +171,18 @@ Output expectations:
 
 You act strictly as an orchestrator, not as an analyzer.
 """
-    return {
-        "prompt_text": fallback_text,
-        "model_settings": {}
-    }
 
-def get_bedrock_configuration(prompt_id: str, prompt_version: str, **variables) -> dict:
+def get_bedrock_system_prompt(prompt_id: str, prompt_version: str, **variables) -> str:
     """
-    Fetches the system prompt and inference configurations from AWS Bedrock.
-    Injects dynamic variables into the prompt text.
+    Fetches the system prompt from AWS Bedrock Prompt Management and injects dynamic variables.
+    Requires Bedrock prompt variables to be formatted as {{variable_name}}.
     """
     if not prompt_id:
         logger.warning("AWS_PROMPT_ID is not set in environment. Going for fallback prompt.")
-        return get_fallback_configuration()
+        return get_fallback_prompt()
 
     try:
-        logger.info(f"Attempting to fetch configuration from Bedrock (ID: {prompt_id}, Version: {prompt_version})")
+        logger.info(f"Attempting to fetch prompt from Bedrock (ID: {prompt_id}, Version: {prompt_version})")
         
         response = bedrock_agent_client.get_prompt(
             promptIdentifier=prompt_id,
@@ -196,65 +192,50 @@ def get_bedrock_configuration(prompt_id: str, prompt_version: str, **variables) 
         variants = response.get("variants", [])
         if not variants:
             logger.error(f"No variants found for prompt {prompt_id}. Going for fallback prompt.")
-            return get_fallback_configuration()
+            return get_fallback_prompt()
             
         template_config = variants[0].get("templateConfiguration", {})
         prompt_text = template_config.get("text", {}).get("text", "")
 
         if not prompt_text:
             logger.error(f"Prompt text is empty in the response. Going for fallback prompt.")
-            return get_fallback_configuration()
-
-        # Extract the Model Configurations from AWS Console
-        inference_config = variants[0].get("inferenceConfiguration", {}).get("text", {})
-        
-        model_settings = {
-            "temperature": inference_config.get("temperature", 0.0),
-            "top_p": inference_config.get("topP", 1.0),
-            "max_tokens": inference_config.get("maxTokens", 2000),
-            "stop_sequences": inference_config.get("stopSequences", [])
-        }
+            return get_fallback_prompt()
 
         # Inject dynamic variables
         for key, value in variables.items():
             prompt_text = prompt_text.replace(f"{{{{{key}}}}}", str(value))
 
-        logger.info(f"Successfully fetched configuration from Bedrock prompt management '{prompt_id}'")    
-        
-        return {
-            "prompt_text": prompt_text,
-            "model_settings": model_settings
-        }
+        logger.info(f"Successfully fetched prompt from Bedrock prompt management '{prompt_text}")
+        logger.info(f"Successfully fetched prompt from Bedrock prompt management '{prompt_id}'")    
+        # logger.info(f"Successfully fetched prompt and injected variables for Bedrock prompt '{prompt_id}'")
+        return prompt_text
 
     except Exception as e:
-        logger.error(f"Failed to fetch configuration from Bedrock due to error: {e}. Going for fallback configuration.")
-        return get_fallback_configuration()
+        logger.error(f"Failed to fetch prompt from Bedrock due to error: {e}. Going for fallback prompt.")
+        return get_fallback_prompt()
 
 
 # Define dynamic variables based on environment and constants
 dynamic_prompt_variables = {
-    "environment":  "prod",
-    "target_audience": "L3 Support Engineers",
-    "timeout_seconds": str(DEFAULT_TIMEOUT)
+    "environment":  os.getenv("ENVIRONMENT",""),
+    "target_audience": os.getenv("TARGET_AUDIENCE",""),
+    "timeout_seconds": os.getenv("DEFAULT_TIMEOUT","")
 }
 
-# Fetch the combined configuration dictionary
-bedrock_config = get_bedrock_configuration(
+# Dynamically set the system prompt
+SYSTEM_PROMPT = get_bedrock_system_prompt(
     prompt_id=AWS_PROMPT_ID,
     prompt_version=AWS_PROMPT_VERSION,
     **dynamic_prompt_variables
 )
 
-# Cleanly separate the variables for developer readability
-SYSTEM_PROMPT = bedrock_config["prompt_text"]
-AWS_MODEL_SETTINGS = bedrock_config["model_settings"]
+
 
 orchestrator_agent = Agent(
     name="IncidentOrchestrator",
     description="Orchestrates the incident analysis pipeline and returns structured insights.",
     system_prompt=SYSTEM_PROMPT,
     tools=[execute_incident_analysis_pipeline],
-    llm_config=AWS_MODEL_SETTINGS
 )
 
 def main():
