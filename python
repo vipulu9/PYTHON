@@ -26,10 +26,27 @@ load_dotenv()
 
 DEFAULT_TIMEOUT = 300  # 5 minutes
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+
+# Initialize AWS Session early to allow SSM parameters loading for Prompt Management
+aws_session = boto3.Session(region_name=AWS_REGION)
+ssm_client = aws_session.client('ssm')
+
+def get_ssm_parameter(param_path: str, fallback_env: str) -> str:
+    """Fetches a configuration value from AWS SSM Parameter Store with an env fallback."""
+    try:
+        response = ssm_client.get_parameter(Name=param_path, WithDecryption=False)
+        return response['Parameter']['Value']
+    except Exception as e:
+        logger.debug(f"SSM path {param_path} not found or inaccessible ({e}). Falling back to environment variable.")
+        return os.getenv(fallback_env, "")
+
+# ARNs remain strictly local/env based
 AWS_ANALYZER_ARN = os.getenv("AWS_ANALYZER_ARN", "")
 AWS_SUMMARIZER_ARN = os.getenv("AWS_SUMMARIZER_ARN", "")
-AWS_PROMPT_ID = os.getenv("AWS_PROMPT_ID", "")
-AWS_PROMPT_VERSION = os.getenv("AWS_PROMPT_VERSION", "")
+
+# Only Prompt Management variables use the new SSM integration
+AWS_PROMPT_ID = get_ssm_parameter("/config/prompt_id", "AWS_PROMPT_ID")
+AWS_PROMPT_VERSION = get_ssm_parameter("/config/prompt_version", "AWS_PROMPT_VERSION")
 
 class SigV4HTTPXAuth(httpx.Auth):
     """HTTPX Auth class that signs requests with AWS SigV4."""
@@ -58,8 +75,6 @@ class SigV4HTTPXAuth(httpx.Auth):
         yield request
 
 
-
-aws_session = boto3.Session(region_name=AWS_REGION)
 bedrock_agent_client = aws_session.client('bedrock-agent')
 
 is_local = os.getenv("ENV", "prod").lower() == "local"
