@@ -26,27 +26,25 @@ load_dotenv()
 
 DEFAULT_TIMEOUT = 300  # 5 minutes
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+AWS_ANALYZER_ARN = os.getenv("AWS_ANALYZER_ARN", "")
+AWS_SUMMARIZER_ARN = os.getenv("AWS_SUMMARIZER_ARN", "")
 
 # Initialize AWS Session early to allow SSM parameters loading for Prompt Management
 aws_session = boto3.Session(region_name=AWS_REGION)
 ssm_client = aws_session.client('ssm')
 
-def get_ssm_parameter(param_path: str, fallback_env: str, default_value: str = "") -> str:
+def get_ssm_parameter(param_path: str, fallback_env: str) -> str:
     """Fetches a configuration value from AWS SSM Parameter Store with an env fallback."""
     try:
         response = ssm_client.get_parameter(Name=param_path, WithDecryption=False)
         return response['Parameter']['Value']
     except Exception as e:
         logger.debug(f"SSM path {param_path} not found or inaccessible ({e}). Falling back to environment variable.")
-        return os.getenv(fallback_env, default_value)
+        #raise ValueError("cannot initialize agent without a prompt ID configuration")
+        return os.getenv(fallback_env, "")
 
-# ARNs remain strictly local/env based
-AWS_ANALYZER_ARN = os.getenv("AWS_ANALYZER_ARN", "")
-AWS_SUMMARIZER_ARN = os.getenv("AWS_SUMMARIZER_ARN", "")
-
-# Only Prompt Management variables use the SSM integration
-AWS_PROMPT_ID = get_ssm_parameter("/config/prompt_id", "AWS_PROMPT_ID", "arn:aws:bedrock:us-east-1:224198986708:prompt/SZDHHZ2T26:3")
-AWS_PROMPT_VERSION = get_ssm_parameter("/config/prompt_version", "AWS_PROMPT_VERSION", "3")
+AWS_PROMPT_ID = get_ssm_parameter("/config/orchestrator_agent/prompt_id", "AWS_PROMPT_ID")
+AWS_PROMPT_VERSION = get_ssm_parameter("/config/orchestrator_agent/prompt_version", "AWS_PROMPT_VERSION")
 
 class SigV4HTTPXAuth(httpx.Auth):
     """HTTPX Auth class that signs requests with AWS SigV4."""
@@ -75,7 +73,6 @@ class SigV4HTTPXAuth(httpx.Auth):
         yield request
 
 
-bedrock_agent_client = aws_session.client('bedrock-agent')
 
 is_local = os.getenv("ENV", "prod").lower() == "local"
 use_arn = os.getenv("USE_ARN", "true").lower() == "true"
@@ -152,6 +149,8 @@ def execute_incident_analysis_pipeline(incident_details: str) -> str:
 #  5. DEFINE THE MASTER ORCHESTRATOR INTERFACE AGENT
 # ========================================================
 
+bedrock_agent_client = aws_session.client('bedrock-agent')
+
 def get_bedrock_configuration(prompt_id: str, prompt_version: str, **variables) -> dict:
     """
     Fetches the system prompt and inference configurations from AWS Bedrock using a retry mechanism.
@@ -170,7 +169,7 @@ def get_bedrock_configuration(prompt_id: str, prompt_version: str, **variables) 
                 promptIdentifier=prompt_id,
                 promptVersion=prompt_version
             )
-            
+            logger.info(response)
             variants = response.get("variants", [])
             if not variants:
                 logger.error(f"No variants found for prompt {prompt_id}.")
@@ -197,7 +196,8 @@ def get_bedrock_configuration(prompt_id: str, prompt_version: str, **variables) 
             for key, value in variables.items():
                 prompt_text = prompt_text.replace(f"{{{{{key}}}}}", str(value))
 
-            logger.info(f"Successfully fetched configuration from Bedrock prompt management '{prompt_id}'")    
+            logger.info(f"Successfully fetched prompt from Bedrock prompt management '{prompt_text}")   
+            logger.info(f"Successfully fetched prompt from Bedrock prompt management '{model_settings}")
             
             return {
                 "prompt_text": prompt_text,
@@ -216,7 +216,7 @@ def get_bedrock_configuration(prompt_id: str, prompt_version: str, **variables) 
 # Define dynamic variables based on environment and constants
 dynamic_prompt_variables = {
     "environment":  "prod",
-    "target_audience": "L3 Support Engineers",
+    "target_audience": "Engineers",
     "timeout_seconds": str(DEFAULT_TIMEOUT)
 }
 
@@ -231,12 +231,13 @@ bedrock_config = get_bedrock_configuration(
 SYSTEM_PROMPT = bedrock_config["prompt_text"]
 AWS_MODEL_SETTINGS = bedrock_config["model_settings"]
 
+
+
 orchestrator_agent = Agent(
     name="IncidentOrchestrator",
     description="Orchestrates the incident analysis pipeline and returns structured insights.",
     system_prompt=SYSTEM_PROMPT,
     tools=[execute_incident_analysis_pipeline],
-    llm_config=AWS_MODEL_SETTINGS
 )
 
 def main():
