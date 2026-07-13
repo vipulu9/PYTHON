@@ -1,191 +1,115 @@
-import os
-import logging
 import boto3
-from pydantic import BaseModel, Field
-from dotenv import load_dotenv
-import time
+import logging
+import json
 
-from mcp_client.client import build_tools_from_mcp
-from strands import Agent, tool
-from strands.multiagent.a2a.executor import StrandsA2AExecutor
-from strands.multiagent.a2a import A2AServer
-from bedrock_agentcore.runtime import serve_a2a
-from model.load import load_model
-from strands_tools.retrieve import retrieve as _kb_retrieve_fn
-
-# Load variables from local .env file
-load_dotenv()
-AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
-
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Initialize AWS Session early to allow SSM parameter loading
-aws_session = boto3.Session(region_name=AWS_REGION)
-ssm_client = aws_session.client('ssm')
-
-def get_ssm_parameter(param_path: str, fallback_env: str) -> str:
-    """Fetches a configuration value from AWS SSM Parameter Store with an env fallback."""
-    try:
-        response = ssm_client.get_parameter(Name=param_path, WithDecryption=False)
-        return response['Parameter']['Value']
-    except Exception as e:
-        logger.debug(f"SSM path {param_path} not found or inaccessible ({e}). Falling back to environment variable.")
-        return os.getenv(fallback_env, "")
-
-AWS_PROMPT_ID = get_ssm_parameter("/config/analyzer_agent/prompt_id", "AWS_PROMPT_ID")
-AWS_PROMPT_VERSION = get_ssm_parameter("/config/analyzer_agent/prompt_version", "AWS_PROMPT_VERSION")
-
-bedrock_agent_client = aws_session.client('bedrock-agent')
-
-#fetching system prompt
-def get_bedrock_system_prompt(prompt_id: str, prompt_version: str, **variables) -> str:
+def deploy_or_update_prompt():
     """
-    Fetches the system prompt from AWS Bedrock using a retry mechanism.
-    Injects dynamic variables into the prompt text.
+    Checks if a specific prompt exists in AWS Bedrock.
+    Updates it if found, creates it if not, and publishes a locked version.
     """
-    if not prompt_id:
-        logger.warning("AWS_PROMPT_ID is not set. Returning empty configuration.")
-        return ""
+    client = boto3.client('bedrock-agent', region_name='us-east-1')
+    sts=boto3.client('sts')
+    prompt_name = "IncidentOrchestrator-Automated1"
+    system_text = """You are an expert incident orchestration agent responsible for coordinating a multi-stage analysis pipeline in {{environment}} environment"""
 
-    max_retries = 3
-    for attempt in range(1, max_retries + 1):
-        try:
-            logger.info(f"Attempting to fetch configuration from Bedrock (ID: {prompt_id}, Version: {prompt_version}) - Try {attempt}")
-            
-            response = bedrock_agent_client.get_prompt(
-                promptIdentifier=prompt_id,
-                promptVersion=prompt_version
-            )
-            
-            variants = response.get("variants", [])
-            if not variants:
-                logger.error(f"No variants found for prompt {prompt_id}.")
-                return ""
-                
-            template_config = variants[0].get("templateConfiguration", {})
-            prompt_text = template_config.get("text", {}).get("text", "")
-
-            if not prompt_text:
-                logger.error(f"Prompt text is empty in the response.")
-                return ""
-
-            # Inject dynamic variables
-            for key, value in variables.items():
-                prompt_text = prompt_text.replace(f"{{{{{key}}}}}", str(value))
-
-            logger.info(f"Successfully fetched prompt from Bedrock prompt management '{prompt_text}")
-            
-            return prompt_text,
-
-        except Exception as e:
-            if attempt < max_retries:
-                logger.warning(f"Attempt {attempt} failed due to error: {e}. Retrying in 2 seconds...")
-                time.sleep(2)
-            else:
-                logger.error(f"Failed to fetch configuration from Bedrock after {max_retries} attempts due to error: {e}.")
-                return ""
-
-# Define dynamic variables based on environment and constants
-dynamic_prompt_variables = {
-    "knowledge_base_id": os.getenv("KNOWLEDGE_BASE_ID","")
-}
-
-# Fetch the combined configuration dictionary
-SYSTEM_PROMPT = get_bedrock_system_prompt(
-    prompt_id=AWS_PROMPT_ID,
-    prompt_version=AWS_PROMPT_VERSION,
-    **dynamic_prompt_variables
-)
-
-@tool
-def knowledge_base_search(query: str) -> str:
-    """Search the Bedrock knowledge base"""
-
-    logger.info("Executing knowledge_base_search tool. Query: '%s'", query)
-
-    kb_id = os.getenv("KNOWLEDGE_BASE_ID","")
-    region = os.getenv("AWS_REGION", "us-east-1")
-
-    if not kb_id:
-        logger.error("KNOWLEDGE_BASE_ID is missing")
-        return "Error: KNOWLEDGE_BASE_ID not configured"
-
-    tool_input = {
-        'toolUseId': 'kb-search',
-        'input': {
-            'text': query,
-            'knowledgeBaseId': kb_id,
-            'region': region,
-            'numberOfResults': 5,
-            'score': 0.35
+    # Define the core variant payload (reusable for both Create and Update)
+    prompt_variant = {
+        "name": "PrimaryVariant",
+        "templateType": "TEXT",
+        "templateConfiguration": {
+            "text": {
+                "text": system_text
+            }
+        },
+        "modelId": "anthropic.claude-3-sonnet-20240229-v1:0",
+        "inferenceConfiguration": {
+            "text": {
+                "temperature": 0.0,  # Locked down for strict routing
+                "topP": 1.0,
+                "maxTokens": 2000,
+                "stopSequences": []
+            }
         }
     }
 
     try:
-        response = _kb_retrieve_fn(tool_input)
+        # ==========================================
+        # STEP 1: Search for existing prompt by name
+        # ==========================================
+        logger.info(f"Checking if prompt '{prompt_name}' already exists in AWS...")
+        existing_prompt_id = None
 
-        status = response.get("status", "error")
-        content = response.get("content", [])
+        # We use a paginator in case you have hundreds of prompts in your account
+        paginator = client.get_paginator('list_prompts')
+        for page in paginator.paginate():
+            for summary in page.get('promptSummaries', []):
+                if summary['name'] == prompt_name:
+                    existing_prompt_id = summary['id']
+                    break
+            if existing_prompt_id:
+                break
 
-        if status != "success" or not content:
-            return f"No results found for: {query}"
+        # ==========================================
+        # STEP 2: Execute Update or Create
+        # ==========================================
+        if existing_prompt_id:
+            logger.info(f"Match found! Updating existing prompt (ID: {existing_prompt_id})...")
+            # Update the existing DRAFT
+            client.update_prompt(
+                promptIdentifier=existing_prompt_id,
+                name=prompt_name,
+                description="Automated prompt update",
+                defaultVariant="PrimaryVariant",
+                variants=[prompt_variant]
+            )
+            final_prompt_id = existing_prompt_id
+            logger.info("Successfully updated the DRAFT version.")
+        else:
+            logger.info(f"No match found. Creating new prompt '{prompt_name}'...")
 
-        return content[0].get("text", f"No results found for: {query}")
+            # Create a brand new DRAFT
+            create_response = client.create_prompt(
+                name=prompt_name,
+                description="Automated prompt creation",
+                defaultVariant="PrimaryVariant",
+                variants=[prompt_variant]
+            )
 
-    except Exception as e:
-        logger.exception("Error in knowledge_base_search")
-        return f"Search error: {str(e)}"
+            #logger.info("Create Prompt Response:")
+            #logger.info(json.dumps(create_response, indent=2, default=str))
 
+            # CHANGED: Access ID directly from response
+            final_prompt_id = create_response['id']
 
-# ========================================================
-#  RUNTIME AND ROUTING UTILITY
-# ========================================================
-def main():
-    logger.info("Starting up AnalyzerAgent system bootstrap lifecycle...")
-    
-    is_local = os.getenv("ENV", "prod").lower() == "local"
-    logger.info("Target execution mode evaluated: [ENV=%s] (is_local=%s)", os.getenv("ENV", "prod"), is_local)
-    
-    logger.info("Initializing Agent and tools within active OpenTelemetry context framework...")
+            logger.info(f"Successfully created a new prompt. ID: {final_prompt_id}")
 
-    try:
-        logger.info("Querying MCP Client tool discovery endpoint...")
-        tools = build_tools_from_mcp()
-        logger.info("MCP discovery complete. Discovered and parsed %d dynamic tools.", len(tools))
-        
-        logger.info("Loading language intelligence model configuration...")
-        llm_model = load_model()
-        logger.info("LLM engine loaded successfully: %s", getattr(llm_model, "model_id", "Default Model Instance"))
+        # ==========================================
+        # STEP 3: Lock and Publish a New Version
+        # ==========================================
+        logger.info("Publishing a new locked version for production...")
 
-        logger.info("Assembling Strands Agent runtime configuration framework...")
-        analyzer_agent = Agent(
-            name="Analyzer Agent",    
-            description="Provides insight on incident data.",  
-            model=llm_model,
-            system_prompt=SYSTEM_PROMPT,
-            tools=[*tools, knowledge_base_search],
+        version_response = client.create_prompt_version(
+            promptIdentifier=final_prompt_id,
+            description="Automated deployment publish"
         )
-        logger.info("Strands Agent assembly verified successfully.")
 
-    except Exception as bootstrap_err:
-        logger.critical("Fatal crash experienced during target component assembly pipeline initialization.", exc_info=True)
-        raise bootstrap_err
+        logger.info("Create Prompt Version Response:")
+        logger.info(json.dumps(version_response, indent=2, default=str))
 
-    if is_local:
-        logger.info("Configuring A2AServer routing interface loop on target port: 9002")
-        a2a_server = A2AServer(
-            agent=analyzer_agent, 
-            port=9002
-        )
-        logger.info("Handing off runtime thread execution control to local HTTP polling loop...")
-        a2a_server.serve()
-    else:
-        logger.info("Building production StrandsA2AExecutor. Running in AWS Bedrock AgentCore runtime environment...")
-        executor = StrandsA2AExecutor(agent=analyzer_agent)
-        
-        logger.info("Running in AWS PRODUCTION environment via Bedrock AgentCore Runtime...")
-        serve_a2a(executor)
+        locked_version = version_response['version']
+
+        logger.info("DEPLOYMENT PIPELINE SUCCESSFUL")
+        logger.info(f"PROMPT ID: {final_prompt_id}")
+        logger.info(f"VERSION:   {locked_version}")
+
+        return final_prompt_id, locked_version
+
+    except Exception:
+        logger.exception("Deployment failed")
+        return None, None
 
 if __name__ == "__main__":
-    main()
+    deploy_or_update_prompt()
