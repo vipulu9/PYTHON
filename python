@@ -1,25 +1,57 @@
 import boto3
 import logging
+import json
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-def delete_existing_prompt():
+def deploy_or_update_prompt():
     """
-    Checks if a specific prompt exists in AWS Bedrock by name.
-    If found, it deletes the entire prompt (including all versions).
+    Checks if a specific prompt exists in AWS Bedrock.
+    Updates it if found, creates it if not, and publishes a locked version.
+    Accepts prompt name dynamically from the terminal with a clean UI.
     """
     client = boto3.client('bedrock-agent', region_name='us-east-1')
-    prompt_name = "IncidentOrchestrator-Automated1"
+    
+    # ==========================================
+    # Get dynamic prompt name from terminal
+    # ==========================================
+    default_name = "IncidentOrchestrator-Automated1"
+    user_input = input(f"Enter the prompt name [Press Enter for default: '{default_name}']\nYou: ").strip()
+    
+    # Use the input if provided, otherwise fall back to the default
+    prompt_name = user_input if user_input else default_name
+    logger.info(f"Target prompt name set to: '{prompt_name}'")
+
+    system_text = """You are an expert incident orchestration agent responsible for coordinating a multi-stage analysis pipeline in {{environment}} environment"""
+
+    # Define the core variant payload (reusable for both Create and Update)
+    prompt_variant = {
+        "name": "PrimaryVariant",
+        "templateType": "TEXT",
+        "templateConfiguration": {
+            "text": {
+                "text": system_text
+            }
+        },
+        "modelId": "anthropic.claude-3-sonnet-20240229-v1:0",
+        "inferenceConfiguration": {
+            "text": {
+                "temperature": 0.0,  
+                "topP": 1.0,
+                "maxTokens": 2000,
+                "stopSequences": []
+            }
+        }
+    }
 
     try:
         # ==========================================
         # STEP 1: Search for existing prompt by name
         # ==========================================
-        logger.info(f"Checking if prompt '{prompt_name}' exists in AWS...")
+        logger.info(f"Checking if prompt '{prompt_name}' already exists in AWS...")
         existing_prompt_id = None
 
-        # We use a paginator in case you have hundreds of prompts in your account
         paginator = client.get_paginator('list_prompts')
         for page in paginator.paginate():
             for summary in page.get('promptSummaries', []):
@@ -30,26 +62,51 @@ def delete_existing_prompt():
                 break
 
         # ==========================================
-        # STEP 2: Execute Deletion
+        # STEP 2: Execute Update or Create
         # ==========================================
         if existing_prompt_id:
-            logger.info(f"Match found! Deleting prompt (ID: {existing_prompt_id})...")
-            
-            # Deleting the prompt by ID. Omitting 'promptVersion' deletes the 
-            # prompt completely, including all locked versions and the DRAFT.
-            client.delete_prompt(
-                promptIdentifier=existing_prompt_id
+            logger.info(f"Match found! Updating existing prompt (ID: {existing_prompt_id})...")
+            client.update_prompt(
+                promptIdentifier=existing_prompt_id,
+                name=prompt_name,
+                description="Automated prompt update",
+                defaultVariant="PrimaryVariant",
+                variants=[prompt_variant]
             )
-            
-            logger.info(f"DELETION SUCCESSFUL: Prompt '{prompt_name}' removed.")
-            return True
+            final_prompt_id = existing_prompt_id
+            logger.info("Successfully updated the DRAFT version.")
         else:
-            logger.info(f"No match found. Prompt '{prompt_name}' is already deleted or never existed.")
-            return False
+            logger.info(f"No match found. Creating new prompt '{prompt_name}'...")
+            create_response = client.create_prompt(
+                name=prompt_name,
+                description="Automated prompt creation",
+                defaultVariant="PrimaryVariant",
+                variants=[prompt_variant]
+            )
+            final_prompt_id = create_response['id']
+            logger.info(f"Successfully created a new prompt. ID: {final_prompt_id}")
+
+        # ==========================================
+        # STEP 3: Lock and Publish a New Version
+        # ==========================================
+        logger.info("Publishing a new locked version for production...")
+
+        version_response = client.create_prompt_version(
+            promptIdentifier=final_prompt_id,
+            description="Automated deployment publish"
+        )
+
+        locked_version = version_response['version']
+
+        logger.info("DEPLOYMENT PIPELINE SUCCESSFUL")
+        logger.info(f"PROMPT ID: {final_prompt_id}")
+        logger.info(f"VERSION:   {locked_version}")
+
+        return final_prompt_id, locked_version
 
     except Exception:
-        logger.exception("Deletion pipeline failed")
-        return False
+        logger.exception("Deployment failed")
+        return None, None
 
 if __name__ == "__main__":
-    delete_existing_prompt()
+    deploy_or_update_prompt()
