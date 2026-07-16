@@ -67,3 +67,5 @@ You act strictly as an orchestrator, not as an analyzer.
  🔹 structured_output  --->  <class 'method'>
  🔹 update_config  --->  <class 'method'>
 ==================================================
+
+https://strandsagents.com/docs/api/typescript/BedrockCacheConfig/#_top
