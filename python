@@ -1,112 +1,322 @@
-import boto3
+import os
 import logging
-import json
+import asyncio
+import time
+import boto3
+import httpx
+from model.load import load_model
+from pydantic import BaseModel, Field
+from botocore.auth import SigV4Auth
+from botocore.awsrequest import AWSRequest
+from a2a.client import ClientConfig
+from opentelemetry import trace, propagate
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+from strands import Agent
+from strands.multiagent import GraphBuilder
+from strands.tools import tool
+from strands.multiagent.a2a.executor import StrandsA2AExecutor
+from strands.multiagent.a2a import A2AServer
+from bedrock_agentcore.runtime import serve_a2a
+from strands.agent.a2a_agent import A2AAgent
+from dotenv import load_dotenv
+from registry.registry_resolver import resolve_agent_endpoint
+
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-def deploy_or_update_prompt():
-    """
-    Checks if a specific prompt exists in AWS Bedrock.
-    Updates it if found, creates it if not, and publishes a locked version.
-    Accepts prompt name dynamically from the terminal with a clean UI.
-    """
-    client = boto3.client('bedrock-agent', region_name='us-east-1')
-    
-    # ==========================================
-    # Get dynamic prompt name from terminal
-    # ==========================================
-    default_name = "IncidentOrchestrator-Automated1"
-    user_input = input(f"Enter the prompt name [Press Enter for default: '{default_name}']\nYou: ").strip()
-    
-    # Use the input if provided, otherwise fall back to the default
-    prompt_name = user_input if user_input else default_name
-    logger.info(f"Target prompt name set to: '{prompt_name}'")
+load_dotenv()
 
-    system_text = """You are an expert incident orchestration agent responsible for coordinating a multi-stage analysis pipeline in {{environment}} environment"""
+# ==========================
+# Configuration
+# ==========================
+DEFAULT_TIMEOUT = 300  # 5 minutes
+REGISTRY_MAX_RETRIES = int(os.getenv("REGISTRY_MAX_RETRIES", "3"))
+REGISTRY_RETRY_DELAY = float(os.getenv("REGISTRY_RETRY_DELAY", "2.0"))
+AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+REGISTRY_ID = os.getenv("REGISTRY_ID", "uMicfmSaX3weY0Ca")
 
-    # Define the core variant payload (reusable for both Create and Update)
-    prompt_variant = {
-        "name": "PrimaryVariant",
-        "templateType": "TEXT",
-        "templateConfiguration": {
-            "text": {
-                "text": system_text
-            }
-        },
-        "modelId": "anthropic.claude-3-sonnet-20240229-v1:0",
-        "inferenceConfiguration": {
-            "text": {
-                "temperature": 0.0,  
-                "topP": 1.0,
-                "maxTokens": 2000,
-                "stopSequences": []
-            }
-        }
-    }
+SUMMARIZER_SEARCH_QUERY = os.getenv("SUMMARIZER_SEARCH_QUERY", "SummarizerAgent")
+ANALYZER_SEARCH_QUERY = "Find an Agent which is used for analyzing incidents. It should be capable for searching servicenow and knowledge base relavant information."
 
+
+# Runtime flags (normalized once)
+_ENV = os.getenv("ENV", "prod")
+IS_LOCAL = _ENV.upper() == "LOCAL"  # controls serving mode (A2AServer vs serve_a2a)
+_USE_LOCAL_AGENTS = os.getenv("USE_LOCAL_AGENTS", "false")
+USE_LOCAL_AGENTS = _USE_LOCAL_AGENTS.strip().upper() == "TRUE"  # controls downstream endpoints
+
+
+# ==========================
+# AWS Auth
+# ==========================
+# Initialize AWS Session early to allow SSM parameter loading
+aws_session = boto3.Session(region_name=AWS_REGION)
+ssm_client = aws_session.client('ssm')
+
+def get_ssm_parameter(param_path: str, fallback_env: str) -> str:
+    """Fetches a configuration value from AWS SSM Parameter Store with an env fallback."""
     try:
-        # ==========================================
-        # STEP 1: Search for existing prompt by name
-        # ==========================================
-        logger.info(f"Checking if prompt '{prompt_name}' already exists in AWS...")
-        existing_prompt_id = None
+        response = ssm_client.get_parameter(Name=param_path, WithDecryption=False)
+        return response['Parameter']['Value']
+    except Exception as e:
+        logger.debug(f"SSM path {param_path} not found or inaccessible ({e}). Falling back to environment variable.")
+        return os.getenv(fallback_env, "")
 
-        paginator = client.get_paginator('list_prompts')
-        for page in paginator.paginate():
-            for summary in page.get('promptSummaries', []):
-                if summary['name'] == prompt_name:
-                    existing_prompt_id = summary['id']
-                    break
-            if existing_prompt_id:
-                break
+AWS_PROMPT_ID = get_ssm_parameter("/config/orchestrator_agent/prompt_id", "AWS_PROMPT_ID")
+AWS_PROMPT_VERSION = get_ssm_parameter("/config/orchestrator_agent/prompt_version", "AWS_PROMPT_VERSION")
 
-        # ==========================================
-        # STEP 2: Execute Update or Create
-        # ==========================================
-        if existing_prompt_id:
-            logger.info(f"Match found! Updating existing prompt (ID: {existing_prompt_id})...")
-            client.update_prompt(
-                promptIdentifier=existing_prompt_id,
-                name=prompt_name,
-                description="Automated prompt update",
-                defaultVariant="PrimaryVariant",
-                variants=[prompt_variant]
-            )
-            final_prompt_id = existing_prompt_id
-            logger.info("Successfully updated the DRAFT version.")
-        else:
-            logger.info(f"No match found. Creating new prompt '{prompt_name}'...")
-            create_response = client.create_prompt(
-                name=prompt_name,
-                description="Automated prompt creation",
-                defaultVariant="PrimaryVariant",
-                variants=[prompt_variant]
-            )
-            final_prompt_id = create_response['id']
-            logger.info(f"Successfully created a new prompt. ID: {final_prompt_id}")
+class SigV4HTTPXAuth(httpx.Auth):
+    """HTTPX Auth class that signs requests with AWS SigV4."""
 
-        # ==========================================
-        # STEP 3: Lock and Publish a New Version
-        # ==========================================
-        logger.info("Publishing a new locked version for production...")
+    def __init__(self, credentials, service: str, region: str):
+        self.credentials = credentials
+        self.service = service
+        self.region = region
+        self.signer = SigV4Auth(credentials, service, region)
 
-        version_response = client.create_prompt_version(
-            promptIdentifier=final_prompt_id,
-            description="Automated deployment publish"
+    def auth_flow(self, request: httpx.Request):
+        """Signs the request with SigV4 and adds the signature to the request headers."""
+        headers = dict(request.headers)
+        headers.pop("connection", None)  # Remove connection header for signature
+
+        aws_request = AWSRequest(
+            method=request.method,
+            url=str(request.url),
+            data=request.content,
+            headers=headers,
         )
 
-        locked_version = version_response['version']
+        self.signer.add_auth(aws_request)
+        request.headers.update(dict(aws_request.headers))
 
-        logger.info("DEPLOYMENT PIPELINE SUCCESSFUL")
-        logger.info(f"PROMPT ID: {final_prompt_id}")
-        logger.info(f"VERSION:   {locked_version}")
+        yield request
 
-        return final_prompt_id, locked_version
+aws_session = boto3.Session(region_name=AWS_REGION)
 
-    except Exception:
-        logger.exception("Deployment failed")
-        return None, None
+# Endpoint container (single mutable structure instead of multiple globals)
+ENDPOINTS = {"analyzer": None, "summarizer": None}
+
+
+# ==========================
+# Registry Resolution
+# ==========================
+
+def _resolve_endpoints_with_retry(
+    max_retries: int = REGISTRY_MAX_RETRIES,
+    retry_delay: float = REGISTRY_RETRY_DELAY,
+) -> tuple[str, str]:
+    """Resolve both agent endpoints from the registry, retrying on transient failures.
+
+    Raises:
+        RuntimeError: If all retry attempts are exhausted.
+    """
+    last_error: Exception | None = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            analyzer_ep = resolve_agent_endpoint(ANALYZER_SEARCH_QUERY, REGISTRY_ID, AWS_REGION)
+            summarizer_ep = resolve_agent_endpoint(SUMMARIZER_SEARCH_QUERY, REGISTRY_ID, AWS_REGION)
+            logger.info("Resolved agent endpoints from registry")
+            return analyzer_ep, summarizer_ep
+        except Exception as exc:
+            last_error = exc
+            if attempt < max_retries:
+                logger.warning(
+                    "Registry lookup failed (attempt %d/%d): %s. Retrying in %.1fs...",
+                    attempt,
+                    max_retries,
+                    exc,
+                    retry_delay,
+                )
+                time.sleep(retry_delay)
+            else:
+                logger.error(
+                    "Registry lookup failed after %d attempts: %s",
+                    max_retries,
+                    exc,
+                )
+    raise RuntimeError(
+        f"Failed to resolve agent endpoints from registry after {max_retries} attempts."
+    ) from last_error
+
+
+# ==========================
+# Graph Construction
+# ==========================
+
+def _make_sigv4_async_client(timeout: int = DEFAULT_TIMEOUT) -> httpx.AsyncClient:
+    """Return a configured AsyncClient signed with SigV4 for Bedrock AgentCore."""
+    creds = aws_session.get_credentials()
+    sigv4_auth = SigV4HTTPXAuth(creds, "bedrock-agentcore", aws_session.region_name)
+    return httpx.AsyncClient(timeout=timeout, auth=sigv4_auth)
+
+
+# Graph node / agent name constants
+ANALYSIS_NODE = "analysis_step"
+SUMMARY_NODE = "summary_step"
+ANALYZER_AGENT_NAME = "analyzer_agent"
+SUMMARIZER_AGENT_NAME = "summarizer_agent"
+
+
+def build_incident_graph():
+    """Create a fresh graph per invocation to avoid cross-event-loop client reuse."""
+    graph = GraphBuilder()
+
+    if USE_LOCAL_AGENTS:
+        analyzer_remote_agent = A2AAgent(endpoint="http://localhost:9002", name=ANALYZER_AGENT_NAME)
+        summarizer_remote_agent = A2AAgent(endpoint="http://localhost:9003", name=SUMMARIZER_AGENT_NAME)
+    else:
+        analyzer_ep = ENDPOINTS.get("analyzer")
+        summarizer_ep = ENDPOINTS.get("summarizer")
+        if not analyzer_ep or not summarizer_ep:
+            raise RuntimeError(
+                "Agent endpoints are not initialized. Ensure registry resolution completed at startup."
+            )
+
+        analyzer_httpx_client = _make_sigv4_async_client()
+        summarizer_httpx_client = _make_sigv4_async_client()
+
+        analyzer_remote_agent = A2AAgent(
+            endpoint=analyzer_ep,
+            name=ANALYZER_AGENT_NAME,
+            client_config=ClientConfig(httpx_client=analyzer_httpx_client),
+        )
+        summarizer_remote_agent = A2AAgent(
+            endpoint=summarizer_ep,
+            name=SUMMARIZER_AGENT_NAME,
+            client_config=ClientConfig(httpx_client=summarizer_httpx_client),
+        )
+
+    graph.add_node(analyzer_remote_agent, ANALYSIS_NODE)
+    graph.add_node(summarizer_remote_agent, SUMMARY_NODE)
+    graph.add_edge(ANALYSIS_NODE, SUMMARY_NODE)
+    graph.set_entry_point(ANALYSIS_NODE)
+    return graph.build()
+
+
+# ==========================
+# Tool Definitions
+# ==========================
+
+
+@tool
+def execute_incident_analysis_pipeline(incident_details: str) -> str:
+    """
+    Invokes the internal multi-agent graph pipeline to route incident logs 
+    sequentially through remote AWS cloud nodes and return a structured summary.
+    """
+    logger.info("Received incident details for processing. Invoking multi-agent analysis pipeline...")
+    current_span = trace.get_current_span()
+    span_context = current_span.get_span_context()
+    trace_id = format(span_context.trace_id, "032x")
+    logger.info("Processing request. trace_id=%s", trace_id)
+
+    compiled_incident_graph = build_incident_graph()
+    result = compiled_incident_graph(incident_details)
+    logger.info("Pipeline result ready")
+    return result
+
+# ========================================================
+#  5. DEFINE THE MASTER ORCHESTRATOR INTERFACE AGENT
+# ========================================================
+
+bedrock_agent_client = aws_session.client('bedrock-agent')
+
+def get_bedrock_system_prompt(prompt_id: str, prompt_version: str, **variables) -> str:
+    """
+    Fetches the system prompt text from AWS Bedrock using a retry mechanism.
+    Injects dynamic variables into the prompt text.
+    """
+    if not prompt_id:
+        logger.warning("AWS_PROMPT_ID is not set. Returning empty configuration.")
+        return ""
+
+    max_retries = 3
+    for attempt in range(1, max_retries + 1):
+        try:
+            logger.info(f"Attempting to fetch configuration from Bedrock (ID: {prompt_id}, Version: {prompt_version}) - Try {attempt}")
+            
+            response = bedrock_agent_client.get_prompt(
+                promptIdentifier=prompt_id,
+                promptVersion=prompt_version
+            )
+            
+            variants = response.get("variants", [])
+            if not variants:
+                logger.error(f"No variants found for prompt {prompt_id}.")
+                return ""
+                
+            template_config = variants[0].get("templateConfiguration", {})
+            prompt_text = template_config.get("text", {}).get("text", "")
+
+            if not prompt_text:
+                logger.error(f"Prompt text is empty in the response.")
+                return ""
+
+            # Inject dynamic variables
+            for key, value in variables.items():
+                prompt_text = prompt_text.replace(f"{{{{{key}}}}}", str(value))
+
+            logger.info(f"Successfully fetched prompt from Bedrock prompt management '{prompt_text}")
+            
+            return prompt_text
+
+        except Exception as e:
+            if attempt < max_retries:
+                logger.warning(f"Attempt {attempt} failed due to error: {e}. Retrying in 2 seconds...")
+                time.sleep(2)
+            else:
+                logger.error(f"Failed to fetch configuration from Bedrock after {max_retries} attempts due to error: {e}.")
+                return {"prompt_text": "", "model_settings": {}}
+
+# Define dynamic variables based on environment and constants
+dynamic_prompt_variables = {
+    "environment":  "prod",
+    "target_audience": "Engineers",
+    "timeout_seconds": str(DEFAULT_TIMEOUT)
+}
+
+# Fetch the system prompt
+SYSTEM_PROMPT = get_bedrock_system_prompt(
+    prompt_id=AWS_PROMPT_ID,
+    prompt_version=AWS_PROMPT_VERSION,
+    **dynamic_prompt_variables
+)
+
+orchestrator_agent = Agent(
+    name="IncidentOrchestrator",
+    description="Orchestrates the incident analysis pipeline and returns structured insights.",
+    system_prompt=SYSTEM_PROMPT,
+    tools=[execute_incident_analysis_pipeline],
+    model=load_model()
+)
+
+
+# ==========================
+# Application Entry Point
+# ==========================
+
+def main():
+    global ENDPOINTS
+
+    if not USE_LOCAL_AGENTS:
+        logger.info("Resolving agent endpoints from registry at startup...")
+        analyzer_ep, summarizer_ep = _resolve_endpoints_with_retry()
+        ENDPOINTS["analyzer"] = analyzer_ep
+        ENDPOINTS["summarizer"] = summarizer_ep
+        
+        print(f"Resolved endpoints: analyzer={analyzer_ep}, summarizer={summarizer_ep}")
+
+    if IS_LOCAL:
+        logger.info("Running orchestrator locally on port 9001")
+        a2a_server = A2AServer(
+            agent=orchestrator_agent,
+            port=9001
+        )
+        a2a_server.serve()
+    else:
+        logger.info("Running orchestrator in production (AgentCore)")
+        executor = StrandsA2AExecutor(agent=orchestrator_agent)
+        serve_a2a(executor)
 
 if __name__ == "__main__":
-    deploy_or_update_prompt()
+    main()
