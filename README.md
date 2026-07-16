@@ -1,18 +1,13 @@
-# 1. Move back out to your main home directory
-cd ~
+# 1. Install prerequisites
+sudo apt-get install -y apt-transport-https software-properties-common wget
 
-# 2. Download the official standalone Grafana package
-wget https://dl.grafana.com/oss/release/grafana-11.0.0.linux-amd64.tar.gz
+# 2. Add the Grafana GPG key
+sudo mkdir -p /etc/apt/keyrings
+wget -q -O - https://apt.grafana.com/gpg.key | gpg --dearmor | sudo tee /etc/apt/keyrings/grafana.gpg > /dev/null
 
-# 3. Extract it
-tar -zxvf grafana-11.0.0.linux-amd64.tar.gz
+# 3. Add the stable repository
+echo "deb [signed-by=/etc/apt/keyrings/grafana.gpg] https://apt.grafana.com stable main" | sudo tee /etc/apt/lists/grafana.list
 
-# 4. Rename the extracted folder to "grafana-standalone" to keep it distinct
-mv grafana-11.0.0 grafana-standalone
-
-# 5. Clean up the downloaded tar file
-rm grafana-11.0.0.linux-amd64.tar.gz
-
-# 6. Move into your brand new standalone folder
-cd ~/grafana-standalone
-
+# 4. Update packages and install Grafana OSS
+sudo apt-get update
+sudo apt-get install -y grafana
