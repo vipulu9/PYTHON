@@ -1,9 +1,34 @@
-vuniyal@LIN-DK4CBV3:~/git/orchestratoragent_agent/app/agent$ uv run python -m main
-Traceback (most recent call last):
-  File "<frozen runpy>", line 198, in _run_module_as_main
-  File "<frozen runpy>", line 88, in _run_code
-  File "/home/vuniyal/git/orchestratoragent_agent/app/agent/main.py", line 7, in <module>
-    from model.load import load_model
-  File "/home/vuniyal/git/orchestratoragent_agent/app/agent/model/load.py", line 10, in <module>
-    from model.load import load_model
-ImportError: cannot import name 'load_model' from partially initialized module 'model.load' (most likely due to a circular import) (/home/vuniyal/git/orchestratoragent_agent/app/agent/model/load.py)
+import sys
+from strands.models.bedrock import BedrockModel
+
+# 1. Loud sanity check to prove this file is actually running in Terminal 1
+print("\n" + "!"*50)
+print("🚨 LOAD.PY IS OFFICIALLY EXECUTING 🚨")
+print("If you do not see this in Terminal 1 when starting the server,")
+print("your environment is caching an old version of the code!")
+print("!"*50 + "\n")
+
+def load_model() -> BedrockModel:
+    print("🛠️ Creating BedrockModel instance...")
+    
+    # Initialize the model as normal
+    model = BedrockModel(model_id="global.anthropic.claude-sonnet-4-5-20250929-v1:0")
+    
+    # 2. The X-Ray Scanner: Print every hidden property inside the model
+    print("\n" + "="*50)
+    print("🔍 DIAGNOSTIC: WHAT IS INSIDE THIS MODEL?")
+    print("="*50)
+    
+    try:
+        # Loop through all properties of the model
+        for attribute_name in dir(model):
+            # Skip built-in python junk like __class__
+            if not attribute_name.startswith('__'): 
+                attribute_value = getattr(model, attribute_name)
+                print(f" 🔹 {attribute_name}  --->  {type(attribute_value)}")
+    except Exception as e:
+        print(f"Could not scan model: {e}")
+        
+    print("="*50 + "\n")
+    
+    return model
