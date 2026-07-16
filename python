@@ -1,10 +1,11 @@
+Model config code
 import os
 import logging
 import asyncio
 import time
 import boto3
 import httpx
-from model.load import load_model
+import inspect
 from pydantic import BaseModel, Field
 from botocore.auth import SigV4Auth
 from botocore.awsrequest import AWSRequest
@@ -12,44 +13,27 @@ from a2a.client import ClientConfig
 from opentelemetry import trace, propagate
 
 from strands import Agent
+from strands.models import BedrockModel
 from strands.multiagent import GraphBuilder
 from strands.tools import tool
 from strands.multiagent.a2a.executor import StrandsA2AExecutor
 from strands.multiagent.a2a import A2AServer
 from bedrock_agentcore.runtime import serve_a2a
 from strands.agent.a2a_agent import A2AAgent
+from urllib.parse import quote
 from dotenv import load_dotenv
-from registry.registry_resolver import resolve_agent_endpoint
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 load_dotenv()
 
-# ==========================
-# Configuration
-# ==========================
+print(inspect.signature(Agent.__init__))
 DEFAULT_TIMEOUT = 300  # 5 minutes
-REGISTRY_MAX_RETRIES = int(os.getenv("REGISTRY_MAX_RETRIES", "3"))
-REGISTRY_RETRY_DELAY = float(os.getenv("REGISTRY_RETRY_DELAY", "2.0"))
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
-REGISTRY_ID = os.getenv("REGISTRY_ID", "uMicfmSaX3weY0Ca")
+AWS_ANALYZER_ARN = os.getenv("AWS_ANALYZER_ARN", "")
+AWS_SUMMARIZER_ARN = os.getenv("AWS_SUMMARIZER_ARN", "")
 
-SUMMARIZER_SEARCH_QUERY = os.getenv("SUMMARIZER_SEARCH_QUERY", "SummarizerAgent")
-ANALYZER_SEARCH_QUERY = "Find an Agent which is used for analyzing incidents. It should be capable for searching servicenow and knowledge base relavant information."
-
-
-# Runtime flags (normalized once)
-_ENV = os.getenv("ENV", "prod")
-IS_LOCAL = _ENV.upper() == "LOCAL"  # controls serving mode (A2AServer vs serve_a2a)
-_USE_LOCAL_AGENTS = os.getenv("USE_LOCAL_AGENTS", "false")
-USE_LOCAL_AGENTS = _USE_LOCAL_AGENTS.strip().upper() == "TRUE"  # controls downstream endpoints
-
-
-# ==========================
-# AWS Auth
-# ==========================
-# Initialize AWS Session early to allow SSM parameter loading
+# Initialize AWS Session early to allow SSM parameters loading for Prompt Management
 aws_session = boto3.Session(region_name=AWS_REGION)
 ssm_client = aws_session.client('ssm')
 
@@ -60,6 +44,7 @@ def get_ssm_parameter(param_path: str, fallback_env: str) -> str:
         return response['Parameter']['Value']
     except Exception as e:
         logger.debug(f"SSM path {param_path} not found or inaccessible ({e}). Falling back to environment variable.")
+        #raise ValueError("cannot initialize agent without a prompt ID configuration")
         return os.getenv(fallback_env, "")
 
 AWS_PROMPT_ID = get_ssm_parameter("/config/orchestrator_agent/prompt_id", "AWS_PROMPT_ID")
@@ -91,111 +76,59 @@ class SigV4HTTPXAuth(httpx.Auth):
 
         yield request
 
-aws_session = boto3.Session(region_name=AWS_REGION)
-
-# Endpoint container (single mutable structure instead of multiple globals)
-ENDPOINTS = {"analyzer": None, "summarizer": None}
 
 
-# ==========================
-# Registry Resolution
-# ==========================
+is_local = os.getenv("ENV", "prod").lower() == "local"
+use_arn = os.getenv("USE_ARN", "true").lower() == "true"
+# Fixed the URL endpoint syntax to use the correct regional Bedrock AgentCore runtime domain
+escaped_analyzer_arn = quote(AWS_ANALYZER_ARN, safe='')
+escaped_summarizer_arn = quote(AWS_SUMMARIZER_ARN, safe='')
 
-def _resolve_endpoints_with_retry(
-    max_retries: int = REGISTRY_MAX_RETRIES,
-    retry_delay: float = REGISTRY_RETRY_DELAY,
-) -> tuple[str, str]:
-    """Resolve both agent endpoints from the registry, retrying on transient failures.
+analyzer_endpoint = f"https://bedrock-agentcore.{AWS_REGION}.amazonaws.com/runtimes/{escaped_analyzer_arn}/invocations/"
+summarizer_endpoint = f"https://bedrock-agentcore.{AWS_REGION}.amazonaws.com/runtimes/{escaped_summarizer_arn}/invocations/"
 
-    Raises:
-        RuntimeError: If all retry attempts are exhausted.
-    """
-    last_error: Exception | None = None
-    for attempt in range(1, max_retries + 1):
-        try:
-            analyzer_ep = resolve_agent_endpoint(ANALYZER_SEARCH_QUERY, REGISTRY_ID, AWS_REGION)
-            summarizer_ep = resolve_agent_endpoint(SUMMARIZER_SEARCH_QUERY, REGISTRY_ID, AWS_REGION)
-            logger.info("Resolved agent endpoints from registry")
-            return analyzer_ep, summarizer_ep
-        except Exception as exc:
-            last_error = exc
-            if attempt < max_retries:
-                logger.warning(
-                    "Registry lookup failed (attempt %d/%d): %s. Retrying in %.1fs...",
-                    attempt,
-                    max_retries,
-                    exc,
-                    retry_delay,
-                )
-                time.sleep(retry_delay)
-            else:
-                logger.error(
-                    "Registry lookup failed after %d attempts: %s",
-                    max_retries,
-                    exc,
-                )
-    raise RuntimeError(
-        f"Failed to resolve agent endpoints from registry after {max_retries} attempts."
-    ) from last_error
-
-
-# ==========================
-# Graph Construction
-# ==========================
-
-def _make_sigv4_async_client(timeout: int = DEFAULT_TIMEOUT) -> httpx.AsyncClient:
-    """Return a configured AsyncClient signed with SigV4 for Bedrock AgentCore."""
-    creds = aws_session.get_credentials()
-    sigv4_auth = SigV4HTTPXAuth(creds, "bedrock-agentcore", aws_session.region_name)
-    return httpx.AsyncClient(timeout=timeout, auth=sigv4_auth)
-
-
-# Graph node / agent name constants
-ANALYSIS_NODE = "analysis_step"
-SUMMARY_NODE = "summary_step"
-ANALYZER_AGENT_NAME = "analyzer_agent"
-SUMMARIZER_AGENT_NAME = "summarizer_agent"
-
+print(f"Analyzer ARN: {AWS_ANALYZER_ARN}")
+print(f"Summarizer ARN: {AWS_SUMMARIZER_ARN}")
+print(f"Analyzer Endpoint: {analyzer_endpoint}")
+print(f"Summarizer Endpoint: {summarizer_endpoint}")
 
 def build_incident_graph():
     """Create a fresh graph per invocation to avoid cross-event-loop client reuse."""
     graph = GraphBuilder()
 
-    if USE_LOCAL_AGENTS:
-        analyzer_remote_agent = A2AAgent(endpoint="http://localhost:9002", name=ANALYZER_AGENT_NAME)
-        summarizer_remote_agent = A2AAgent(endpoint="http://localhost:9003", name=SUMMARIZER_AGENT_NAME)
+    if not use_arn:
+        analyzer_remote_agent = A2AAgent(endpoint="http://localhost:9002", name="analyzer_agent")
+        summarizer_remote_agent = A2AAgent(endpoint="http://localhost:9003", name="summarizer_agent")
     else:
-        analyzer_ep = ENDPOINTS.get("analyzer")
-        summarizer_ep = ENDPOINTS.get("summarizer")
-        if not analyzer_ep or not summarizer_ep:
-            raise RuntimeError(
-                "Agent endpoints are not initialized. Ensure registry resolution completed at startup."
-            )
+        region = aws_session.region_name
+        credentials = aws_session.get_credentials()
+        sigv4_auth = SigV4HTTPXAuth(credentials, "bedrock-agentcore", region)
 
-        analyzer_httpx_client = _make_sigv4_async_client()
-        summarizer_httpx_client = _make_sigv4_async_client()
+        analyzer_httpx_client = httpx.AsyncClient(
+            timeout=DEFAULT_TIMEOUT,
+            auth=sigv4_auth,
+        )
+        summarizer_httpx_client = httpx.AsyncClient(
+            timeout=DEFAULT_TIMEOUT,
+            auth=sigv4_auth,
+        )
 
         analyzer_remote_agent = A2AAgent(
-            endpoint=analyzer_ep,
-            name=ANALYZER_AGENT_NAME,
+            endpoint=analyzer_endpoint,
+            name="analyzer_agent",
             client_config=ClientConfig(httpx_client=analyzer_httpx_client),
         )
         summarizer_remote_agent = A2AAgent(
-            endpoint=summarizer_ep,
-            name=SUMMARIZER_AGENT_NAME,
+            endpoint=summarizer_endpoint,
+            name="summarizer_agent",
             client_config=ClientConfig(httpx_client=summarizer_httpx_client),
         )
 
-    graph.add_node(analyzer_remote_agent, ANALYSIS_NODE)
-    graph.add_node(summarizer_remote_agent, SUMMARY_NODE)
-    graph.add_edge(ANALYSIS_NODE, SUMMARY_NODE)
-    graph.set_entry_point(ANALYSIS_NODE)
+    graph.add_node(analyzer_remote_agent, "analysis_step")
+    graph.add_node(summarizer_remote_agent, "summary_step")
+    graph.add_edge("analysis_step", "summary_step")
+    graph.set_entry_point("analysis_step")
     return graph.build()
-
-
-# ==========================
-# Tool Definitions
-# ==========================
 
 
 @tool
@@ -211,8 +144,9 @@ def execute_incident_analysis_pipeline(incident_details: str) -> str:
     logger.info("Processing request. trace_id=%s", trace_id)
 
     compiled_incident_graph = build_incident_graph()
-    result = compiled_incident_graph(incident_details)
-    logger.info("Pipeline result ready")
+    payload = incident_details
+    result = compiled_incident_graph(payload)
+    print(result)
     return result
 
 # ========================================================
@@ -221,15 +155,14 @@ def execute_incident_analysis_pipeline(incident_details: str) -> str:
 
 bedrock_agent_client = aws_session.client('bedrock-agent')
 
-def get_bedrock_system_prompt(prompt_id: str, prompt_version: str, **variables):
+def get_bedrock_configuration(prompt_id: str, prompt_version: str, **variables) -> dict:
     """
-    Fetches the system prompt text from AWS Bedrock using a retry mechanism.
-    Supports caching by extracting the 'chat' block structure if present, 
-    otherwise falls back to plain text parsing. Injects dynamic variables.
+    Fetches the system prompt and inference configurations from AWS Bedrock using a retry mechanism.
+    Injects dynamic variables into the prompt text.
     """
     if not prompt_id:
         logger.warning("AWS_PROMPT_ID is not set. Returning empty configuration.")
-        return ""
+        return {"prompt_text": "", "model_settings": {}}
 
     max_retries = 3
     for attempt in range(1, max_retries + 1):
@@ -240,45 +173,40 @@ def get_bedrock_system_prompt(prompt_id: str, prompt_version: str, **variables):
                 promptIdentifier=prompt_id,
                 promptVersion=prompt_version
             )
-            
+            logger.info(response)
             variants = response.get("variants", [])
             if not variants:
                 logger.error(f"No variants found for prompt {prompt_id}.")
-                return ""
+                return {"prompt_text": "", "model_settings": {}}
                 
             template_config = variants[0].get("templateConfiguration", {})
-            
-            # Bedrock caching utilizes the 'chat' format to embed cachePoint markers
-            if "chat" in template_config:
-                system_blocks = template_config["chat"].get("system", [])
-                
-                processed_blocks = []
-                for block in system_blocks:
-                    if "text" in block:
-                        block_text = block["text"]
-                        for key, value in variables.items():
-                            block_text = block_text.replace(f"{{{{{key}}}}}", str(value))
-                        processed_blocks.append({"text": block_text})
-                    elif "cachePoint" in block:
-                        # Retain the cache checkpoint marker for the downstream model runtime
-                        processed_blocks.append(block)  
-                
-                logger.info("Successfully fetched chat prompt with caching configurations from Bedrock.")
-                return processed_blocks
-
-            # Fallback for standard text templates (no caching configured)
             prompt_text = template_config.get("text", {}).get("text", "")
+
             if not prompt_text:
-                logger.error("Prompt text is empty in the response.")
-                return ""
+                logger.error(f"Prompt text is empty in the response.")
+                return {"prompt_text": "", "model_settings": {}}
+
+            # Extract the Model Configurations from AWS Console
+            inference_config = variants[0].get("inferenceConfiguration", {}).get("text", {})
+            
+            model_settings = {
+                "temperature": inference_config.get("temperature", 0.0),
+                "top_p": inference_config.get("topP", 1.0),
+                "max_tokens": inference_config.get("maxTokens", 2000),
+                "stop_sequences": inference_config.get("stopSequences", [])
+            }
 
             # Inject dynamic variables
             for key, value in variables.items():
                 prompt_text = prompt_text.replace(f"{{{{{key}}}}}", str(value))
 
-            logger.info(f"Successfully fetched prompt from Bedrock prompt management.")
+            logger.info(f"Successfully fetched prompt from Bedrock prompt management '{prompt_text}")   
+            logger.info(f"Successfully fetched prompt from Bedrock prompt management '{model_settings}")
             
-            return prompt_text
+            return {
+                "prompt_text": prompt_text,
+                "model_settings": model_settings
+            }
 
         except Exception as e:
             if attempt < max_retries:
@@ -288,6 +216,7 @@ def get_bedrock_system_prompt(prompt_id: str, prompt_version: str, **variables):
                 logger.error(f"Failed to fetch configuration from Bedrock after {max_retries} attempts due to error: {e}.")
                 return {"prompt_text": "", "model_settings": {}}
 
+
 # Define dynamic variables based on environment and constants
 dynamic_prompt_variables = {
     "environment":  "prod",
@@ -295,49 +224,45 @@ dynamic_prompt_variables = {
     "timeout_seconds": str(DEFAULT_TIMEOUT)
 }
 
-# Fetch the system prompt
-SYSTEM_PROMPT = get_bedrock_system_prompt(
+# Fetch the combined configuration dictionary
+bedrock_config = get_bedrock_configuration(
     prompt_id=AWS_PROMPT_ID,
     prompt_version=AWS_PROMPT_VERSION,
     **dynamic_prompt_variables
 )
+
+# Cleanly separate the variables for developer readability
+SYSTEM_PROMPT = bedrock_config["prompt_text"]
+AWS_MODEL_SETTINGS = bedrock_config["model_settings"]
+
+AWS_MODEL_SETTINGS.pop("top_p", None)
+orchestrator_model = BedrockModel(
+    model_id="global.anthropic.claude-sonnet-4-5-20250929-v1:0",
+    **AWS_MODEL_SETTINGS
+)
+
 
 orchestrator_agent = Agent(
     name="IncidentOrchestrator",
     description="Orchestrates the incident analysis pipeline and returns structured insights.",
     system_prompt=SYSTEM_PROMPT,
     tools=[execute_incident_analysis_pipeline],
-    model=load_model()
+    model=orchestrator_model
 )
 
-
-# ==========================
-# Application Entry Point
-# ==========================
-
 def main():
-    global ENDPOINTS
 
-    if not USE_LOCAL_AGENTS:
-        logger.info("Resolving agent endpoints from registry at startup...")
-        analyzer_ep, summarizer_ep = _resolve_endpoints_with_retry()
-        ENDPOINTS["analyzer"] = analyzer_ep
-        ENDPOINTS["summarizer"] = summarizer_ep
-        
-        print(f"Resolved endpoints: analyzer={analyzer_ep}, summarizer={summarizer_ep}")
-
-    if IS_LOCAL:
-        logger.info("Running orchestrator locally on port 9001")
+    if is_local:
+        logger.info("Running Master orchestrator in LOCAL mode via Strands A2AServer on port 9001...")
         a2a_server = A2AServer(
             agent=orchestrator_agent,
             port=9001
         )
         a2a_server.serve()
     else:
-        logger.info("Running orchestrator in production (AgentCore)")
+        logger.info("Running Master orchestrator in AWS PRODUCTION environment via Bedrock AgentCore Runtime...")
         executor = StrandsA2AExecutor(agent=orchestrator_agent)
         serve_a2a(executor)
 
 if __name__ == "__main__":
     main()
-
