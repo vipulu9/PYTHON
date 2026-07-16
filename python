@@ -1,268 +1,95 @@
-Model config code
-import os
-import logging
-import asyncio
-import time
 import boto3
-import httpx
-import inspect
-from pydantic import BaseModel, Field
-from botocore.auth import SigV4Auth
-from botocore.awsrequest import AWSRequest
-from a2a.client import ClientConfig
-from opentelemetry import trace, propagate
+import json
+from strands.models.bedrock import BedrockModel
 
-from strands import Agent
-from strands.models import BedrockModel
-from strands.multiagent import GraphBuilder
-from strands.tools import tool
-from strands.multiagent.a2a.executor import StrandsA2AExecutor
-from strands.multiagent.a2a import A2AServer
-from bedrock_agentcore.runtime import serve_a2a
-from strands.agent.a2a_agent import A2AAgent
-from urllib.parse import quote
-from dotenv import load_dotenv
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-load_dotenv()
-
-print(inspect.signature(Agent.__init__))
-DEFAULT_TIMEOUT = 300  # 5 minutes
-AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
-AWS_ANALYZER_ARN = os.getenv("AWS_ANALYZER_ARN", "")
-AWS_SUMMARIZER_ARN = os.getenv("AWS_SUMMARIZER_ARN", "")
-
-# Initialize AWS Session early to allow SSM parameters loading for Prompt Management
-aws_session = boto3.Session(region_name=AWS_REGION)
-ssm_client = aws_session.client('ssm')
-
-def get_ssm_parameter(param_path: str, fallback_env: str) -> str:
-    """Fetches a configuration value from AWS SSM Parameter Store with an env fallback."""
-    try:
-        response = ssm_client.get_parameter(Name=param_path, WithDecryption=False)
-        return response['Parameter']['Value']
-    except Exception as e:
-        logger.debug(f"SSM path {param_path} not found or inaccessible ({e}). Falling back to environment variable.")
-        #raise ValueError("cannot initialize agent without a prompt ID configuration")
-        return os.getenv(fallback_env, "")
-
-AWS_PROMPT_ID = get_ssm_parameter("/config/orchestrator_agent/prompt_id", "AWS_PROMPT_ID")
-AWS_PROMPT_VERSION = get_ssm_parameter("/config/orchestrator_agent/prompt_version", "AWS_PROMPT_VERSION")
-
-class SigV4HTTPXAuth(httpx.Auth):
-    """HTTPX Auth class that signs requests with AWS SigV4."""
-
-    def __init__(self, credentials, service: str, region: str):
-        self.credentials = credentials
-        self.service = service
-        self.region = region
-        self.signer = SigV4Auth(credentials, service, region)
-
-    def auth_flow(self, request: httpx.Request):
-        """Signs the request with SigV4 and adds the signature to the request headers."""
-        headers = dict(request.headers)
-        headers.pop("connection", None)  # Remove connection header for signature
-
-        aws_request = AWSRequest(
-            method=request.method,
-            url=str(request.url),
-            data=request.content,
-            headers=headers,
-        )
-
-        self.signer.add_auth(aws_request)
-        request.headers.update(dict(aws_request.headers))
-
-        yield request
-
-
-
-is_local = os.getenv("ENV", "prod").lower() == "local"
-use_arn = os.getenv("USE_ARN", "true").lower() == "true"
-# Fixed the URL endpoint syntax to use the correct regional Bedrock AgentCore runtime domain
-escaped_analyzer_arn = quote(AWS_ANALYZER_ARN, safe='')
-escaped_summarizer_arn = quote(AWS_SUMMARIZER_ARN, safe='')
-
-analyzer_endpoint = f"https://bedrock-agentcore.{AWS_REGION}.amazonaws.com/runtimes/{escaped_analyzer_arn}/invocations/"
-summarizer_endpoint = f"https://bedrock-agentcore.{AWS_REGION}.amazonaws.com/runtimes/{escaped_summarizer_arn}/invocations/"
-
-print(f"Analyzer ARN: {AWS_ANALYZER_ARN}")
-print(f"Summarizer ARN: {AWS_SUMMARIZER_ARN}")
-print(f"Analyzer Endpoint: {analyzer_endpoint}")
-print(f"Summarizer Endpoint: {summarizer_endpoint}")
-
-def build_incident_graph():
-    """Create a fresh graph per invocation to avoid cross-event-loop client reuse."""
-    graph = GraphBuilder()
-
-    if not use_arn:
-        analyzer_remote_agent = A2AAgent(endpoint="http://localhost:9002", name="analyzer_agent")
-        summarizer_remote_agent = A2AAgent(endpoint="http://localhost:9003", name="summarizer_agent")
-    else:
-        region = aws_session.region_name
-        credentials = aws_session.get_credentials()
-        sigv4_auth = SigV4HTTPXAuth(credentials, "bedrock-agentcore", region)
-
-        analyzer_httpx_client = httpx.AsyncClient(
-            timeout=DEFAULT_TIMEOUT,
-            auth=sigv4_auth,
-        )
-        summarizer_httpx_client = httpx.AsyncClient(
-            timeout=DEFAULT_TIMEOUT,
-            auth=sigv4_auth,
-        )
-
-        analyzer_remote_agent = A2AAgent(
-            endpoint=analyzer_endpoint,
-            name="analyzer_agent",
-            client_config=ClientConfig(httpx_client=analyzer_httpx_client),
-        )
-        summarizer_remote_agent = A2AAgent(
-            endpoint=summarizer_endpoint,
-            name="summarizer_agent",
-            client_config=ClientConfig(httpx_client=summarizer_httpx_client),
-        )
-
-    graph.add_node(analyzer_remote_agent, "analysis_step")
-    graph.add_node(summarizer_remote_agent, "summary_step")
-    graph.add_edge("analysis_step", "summary_step")
-    graph.set_entry_point("analysis_step")
-    return graph.build()
-
-
-@tool
-def execute_incident_analysis_pipeline(incident_details: str) -> str:
+class CacheInterceptingClient:
     """
-    Invokes the internal multi-agent graph pipeline to route incident logs 
-    sequentially through remote AWS cloud nodes and return a structured summary.
+    A wrapper class that intercepts the Boto3 Bedrock Runtime client.
+    It injects prompt caching markers and explicitly logs usage details.
     """
-    logger.info("Received incident details for processing. Invoking multi-agent analysis pipeline...")
-    current_span = trace.get_current_span()
-    span_context = current_span.get_span_context()
-    trace_id = format(span_context.trace_id, "032x")
-    logger.info("Processing request. trace_id=%s", trace_id)
-
-    compiled_incident_graph = build_incident_graph()
-    payload = incident_details
-    result = compiled_incident_graph(payload)
-    print(result)
-    return result
-
-# ========================================================
-#  5. DEFINE THE MASTER ORCHESTRATOR INTERFACE AGENT
-# ========================================================
-
-bedrock_agent_client = aws_session.client('bedrock-agent')
-
-def get_bedrock_configuration(prompt_id: str, prompt_version: str, **variables) -> dict:
-    """
-    Fetches the system prompt and inference configurations from AWS Bedrock using a retry mechanism.
-    Injects dynamic variables into the prompt text.
-    """
-    if not prompt_id:
-        logger.warning("AWS_PROMPT_ID is not set. Returning empty configuration.")
-        return {"prompt_text": "", "model_settings": {}}
-
-    max_retries = 3
-    for attempt in range(1, max_retries + 1):
-        try:
-            logger.info(f"Attempting to fetch configuration from Bedrock (ID: {prompt_id}, Version: {prompt_version}) - Try {attempt}")
-            
-            response = bedrock_agent_client.get_prompt(
-                promptIdentifier=prompt_id,
-                promptVersion=prompt_version
-            )
-            logger.info(response)
-            variants = response.get("variants", [])
-            if not variants:
-                logger.error(f"No variants found for prompt {prompt_id}.")
-                return {"prompt_text": "", "model_settings": {}}
+    def __init__(self):
+        self._real_client = boto3.client("bedrock-runtime")
+        
+    def converse(self, **kwargs):
+        print("\n⚡ [INTERCEPTOR] converse() method triggered by Strands framework!")
+        
+        # 1. Inject Cache Point into the System Instructions
+        if "system" in kwargs and isinstance(kwargs["system"], list):
+            if kwargs["system"]:
+                kwargs["system"].append({"cachePoint": {"type": "default"}})
+                print("📌 [INTERCEPTOR] Injected cachePoint into System Prompts")
                 
-            template_config = variants[0].get("templateConfiguration", {})
-            prompt_text = template_config.get("text", {}).get("text", "")
-
-            if not prompt_text:
-                logger.error(f"Prompt text is empty in the response.")
-                return {"prompt_text": "", "model_settings": {}}
-
-            # Extract the Model Configurations from AWS Console
-            inference_config = variants[0].get("inferenceConfiguration", {}).get("text", {})
-            
-            model_settings = {
-                "temperature": inference_config.get("temperature", 0.0),
-                "top_p": inference_config.get("topP", 1.0),
-                "max_tokens": inference_config.get("maxTokens", 2000),
-                "stop_sequences": inference_config.get("stopSequences", [])
-            }
-
-            # Inject dynamic variables
-            for key, value in variables.items():
-                prompt_text = prompt_text.replace(f"{{{{{key}}}}}", str(value))
-
-            logger.info(f"Successfully fetched prompt from Bedrock prompt management '{prompt_text}")   
-            logger.info(f"Successfully fetched prompt from Bedrock prompt management '{model_settings}")
-            
-            return {
-                "prompt_text": prompt_text,
-                "model_settings": model_settings
-            }
-
+        # 2. Inject Cache Point into the Tools 
+        if "toolConfig" in kwargs and "tools" in kwargs["toolConfig"]:
+            if kwargs["toolConfig"]["tools"]:
+                kwargs["toolConfig"]["tools"].append({"cachePoint": {"type": "default"}})
+                print("📌 [INTERCEPTOR] Injected cachePoint into Tools")
+                
+        # 3. Execute the actual API call
+        response = self._real_client.converse(**kwargs)
+        
+        # 4. Explicit Metrics Logging
+        try:
+            usage = response.get('usage', {})
+            print("\n" + "="*45)
+            print("💰 BEDROCK TOKEN USAGE REPORT (converse)")
+            print("="*45)
+            print(f"Total Input Tokens:    {usage.get('inputTokens', 'N/A')}")
+            print(f"Total Output Tokens:   {usage.get('outputTokens', 'N/A')}")
+            print(f"Tokens Cached (Write): {usage.get('cacheCreationInputTokenCount', 0)}")
+            print(f"Tokens Read (Cache):   {usage.get('cacheReadInputTokenCount', 0)}")
+            print("="*45 + "\n")
         except Exception as e:
-            if attempt < max_retries:
-                logger.warning(f"Attempt {attempt} failed due to error: {e}. Retrying in 2 seconds...")
-                time.sleep(2)
-            else:
-                logger.error(f"Failed to fetch configuration from Bedrock after {max_retries} attempts due to error: {e}.")
-                return {"prompt_text": "", "model_settings": {}}
+            print(f"❌ [INTERCEPTOR ERROR] Failed to parse converse metrics: {e}")
+            
+        return response
+
+    def invoke_model(self, **kwargs):
+        """Fallback interceptor in case Strands uses the older invoke_model API."""
+        print("\n⚡ [INTERCEPTOR] invoke_model() method triggered by Strands framework!")
+        
+        # If strands uses invoke_model, kwargs['body'] contains a string/bytes JSON payload
+        if "body" in kwargs:
+            try:
+                body_data = json.loads(kwargs["body"])
+                # Perform injection depending on Bedrock's anthropic native structure if applicable
+                # (This is a fallback safeguard)
+                kwargs["body"] = json.dumps(body_data)
+            except Exception as e:
+                print(f"⚠️ [INTERCEPTOR] Could not modify invoke_model body: {e}")
+
+        response = self._real_client.invoke_model(**kwargs)
+        
+        try:
+            print("\n" + "="*45)
+            print("💰 BEDROCK RESPONSE RECEIVED (invoke_model)")
+            print("="*45)
+            # Standard invoke_model doesn't return cache tokens in the same way, 
+            # but this verifies the call is going through here.
+            print("Call successful. Check response headers or body for usage tokens.")
+            print("="*45 + "\n")
+        except Exception as e:
+            print(f"❌ [INTERCEPTOR ERROR] Failed during invoke_model logging: {e}")
+            
+        return response
+        
+    def __getattr__(self, name):
+        # Fallback for any other methods called by the framework
+        return getattr(self._real_client, name)
 
 
-# Define dynamic variables based on environment and constants
-dynamic_prompt_variables = {
-    "environment":  "prod",
-    "target_audience": "Engineers",
-    "timeout_seconds": str(DEFAULT_TIMEOUT)
-}
-
-# Fetch the combined configuration dictionary
-bedrock_config = get_bedrock_configuration(
-    prompt_id=AWS_PROMPT_ID,
-    prompt_version=AWS_PROMPT_VERSION,
-    **dynamic_prompt_variables
-)
-
-# Cleanly separate the variables for developer readability
-SYSTEM_PROMPT = bedrock_config["prompt_text"]
-AWS_MODEL_SETTINGS = bedrock_config["model_settings"]
-
-AWS_MODEL_SETTINGS.pop("top_p", None)
-orchestrator_model = BedrockModel(
-    model_id="global.anthropic.claude-sonnet-4-5-20250929-v1:0",
-    **AWS_MODEL_SETTINGS
-)
-
-
-orchestrator_agent = Agent(
-    name="IncidentOrchestrator",
-    description="Orchestrates the incident analysis pipeline and returns structured insights.",
-    system_prompt=SYSTEM_PROMPT,
-    tools=[execute_incident_analysis_pipeline],
-    model=orchestrator_model
-)
-
-def main():
-
-    if is_local:
-        logger.info("Running Master orchestrator in LOCAL mode via Strands A2AServer on port 9001...")
-        a2a_server = A2AServer(
-            agent=orchestrator_agent,
-            port=9001
-        )
-        a2a_server.serve()
-    else:
-        logger.info("Running Master orchestrator in AWS PRODUCTION environment via Bedrock AgentCore Runtime...")
-        executor = StrandsA2AExecutor(agent=orchestrator_agent)
-        serve_a2a(executor)
-
-if __name__ == "__main__":
-    main()
+def load_model() -> BedrockModel:
+    """Get Bedrock model client and inject the caching interceptor."""
+    caching_client = CacheInterceptingClient()
+    
+    model = BedrockModel(model_id="global.anthropic.claude-sonnet-4-5-20250929-v1:0")
+    
+    # Forcefully override the library's internal client references
+    if hasattr(model, 'client'):
+        model.client = caching_client
+    if hasattr(model, '_client'):
+        model._client = caching_client
+    if hasattr(model, 'bedrock_client'):
+        model.bedrock_client = caching_client
+        
+    return model
