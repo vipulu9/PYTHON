@@ -1,68 +1,9 @@
-import boto3
-from strands.models.bedrock import BedrockModel
-
-class CacheInterceptingClient:
-    """
-    A wrapper class that intercepts the Boto3 Bedrock Runtime client.
-    It silently injects Bedrock Prompt Caching markers into the final payload 
-    and prints local token usage metrics to prove caching is working.
-    """
-    def __init__(self):
-        # Initialize the real Bedrock Runtime client using default session/credentials
-        self._real_client = boto3.client("bedrock-runtime")
-        
-    def converse(self, **kwargs):
-        # 1. Inject Cache Point into the System Instructions
-        if "system" in kwargs and isinstance(kwargs["system"], list):
-            if kwargs["system"]:  # Ensure the system array is not empty
-                kwargs["system"].append({"cachePoint": {"type": "default"}})
-                
-        # 2. Inject Cache Point into the Tools 
-        # (Caching your execute_incident_analysis_pipeline tool saves massive tokens)
-        if "toolConfig" in kwargs and "tools" in kwargs["toolConfig"]:
-            if kwargs["toolConfig"]["tools"]:
-                kwargs["toolConfig"]["tools"].append({"cachePoint": {"type": "default"}})
-                
-        # 3. Execute the actual API call with the dynamically injected cache points
-        response = self._real_client.converse(**kwargs)
-        
-        # 4. Intercept the response and print token usage metrics to the terminal
-        try:
-            usage = response.get('usage', {})
-            print("\n" + "="*45)
-            print("💰 BEDROCK TOKEN USAGE REPORT")
-            print("="*45)
-            # Standard tokens
-            print(f"Total Input Tokens:  {usage.get('inputTokens', 0)}")
-            print(f"Total Output Tokens: {usage.get('outputTokens', 0)}")
-            # Cache-specific tokens 
-            print(f"Tokens Cached (Write): {usage.get('cacheCreationInputTokenCount', 0)}")
-            print(f"Tokens Read (Cache):   {usage.get('cacheReadInputTokenCount', 0)}")
-            print("="*45 + "\n")
-        except Exception:
-            pass # Failsafe so we don't break your app if logging fails
-            
-        return response
-        
-    def __getattr__(self, name):
-        # Forward all other standard boto3 methods to the real client seamlessly
-        return getattr(self._real_client, name)
-
-
-def load_model() -> BedrockModel:
-    """Get Bedrock model client using IAM credentials and inject the caching interceptor."""
-    caching_client = CacheInterceptingClient()
-    
-    # Initialize your Strands model exactly as you had it
-    model = BedrockModel(model_id="global.anthropic.claude-sonnet-4-5-20250929-v1:0")
-    
-    # Forcefully override the library's internal boto3 client with our interceptor.
-    # We check the most common Boto3 client attribute names used by abstractions.
-    if hasattr(model, 'client'):
-        model.client = caching_client
-    elif hasattr(model, '_client'):
-        model._client = caching_client
-    elif hasattr(model, 'bedrock_client'):
-        model.bedrock_client = caching_client
-        
-    return model
+vuniyal@LIN-DK4CBV3:~/git/orchestratoragent_agent/app/agent$ uv run python -m main
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/home/vuniyal/git/orchestratoragent_agent/app/agent/main.py", line 7, in <module>
+    from model.load import load_model
+  File "/home/vuniyal/git/orchestratoragent_agent/app/agent/model/load.py", line 10, in <module>
+    from model.load import load_model
+ImportError: cannot import name 'load_model' from partially initialized module 'model.load' (most likely due to a circular import) (/home/vuniyal/git/orchestratoragent_agent/app/agent/model/load.py)
