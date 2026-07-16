@@ -98,90 +98,225 @@ ENDPOINTS = {"analyzer": None, "summarizer": None}
 
 
 # ==========================
-# Bedrock Prompt Management & Caching
+# Registry Resolution
 # ==========================
-bedrock_agent_client = aws_session.client('bedrock-agent')
-bedrock_runtime_client = aws_session.client('bedrock-runtime')
 
-async def fetch_managed_prompt(prompt_id: str, prompt_version: str) -> dict:
+def _resolve_endpoints_with_retry(
+    max_retries: int = REGISTRY_MAX_RETRIES,
+    retry_delay: float = REGISTRY_RETRY_DELAY,
+) -> tuple[str, str]:
+    """Resolve both agent endpoints from the registry, retrying on transient failures.
+
+    Raises:
+        RuntimeError: If all retry attempts are exhausted.
     """
-    Fetches the prompt from Bedrock Prompt Management.
-    The response automatically includes any cachePoint configurations defined in the console.
-    """
-    logger.info(f"Fetching managed prompt {prompt_id}, version {prompt_version}")
-    try:
-        # Run synchronous boto3 call in an executor to avoid blocking the event loop
-        response = await asyncio.to_thread(
-            bedrock_agent_client.get_prompt,
-            promptIdentifier=prompt_id,
-            promptVersion=prompt_version
+    last_error: Exception | None = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            analyzer_ep = resolve_agent_endpoint(ANALYZER_SEARCH_QUERY, REGISTRY_ID, AWS_REGION)
+            summarizer_ep = resolve_agent_endpoint(SUMMARIZER_SEARCH_QUERY, REGISTRY_ID, AWS_REGION)
+            logger.info("Resolved agent endpoints from registry")
+            return analyzer_ep, summarizer_ep
+        except Exception as exc:
+            last_error = exc
+            if attempt < max_retries:
+                logger.warning(
+                    "Registry lookup failed (attempt %d/%d): %s. Retrying in %.1fs...",
+                    attempt,
+                    max_retries,
+                    exc,
+                    retry_delay,
+                )
+                time.sleep(retry_delay)
+            else:
+                logger.error(
+                    "Registry lookup failed after %d attempts: %s",
+                    max_retries,
+                    exc,
+                )
+    raise RuntimeError(
+        f"Failed to resolve agent endpoints from registry after {max_retries} attempts."
+    ) from last_error
+
+
+# ==========================
+# Graph Construction
+# ==========================
+
+def _make_sigv4_async_client(timeout: int = DEFAULT_TIMEOUT) -> httpx.AsyncClient:
+    """Return a configured AsyncClient signed with SigV4 for Bedrock AgentCore."""
+    creds = aws_session.get_credentials()
+    sigv4_auth = SigV4HTTPXAuth(creds, "bedrock-agentcore", aws_session.region_name)
+    return httpx.AsyncClient(timeout=timeout, auth=sigv4_auth)
+
+
+# Graph node / agent name constants
+ANALYSIS_NODE = "analysis_step"
+SUMMARY_NODE = "summary_step"
+ANALYZER_AGENT_NAME = "analyzer_agent"
+SUMMARIZER_AGENT_NAME = "summarizer_agent"
+
+
+def build_incident_graph():
+    """Create a fresh graph per invocation to avoid cross-event-loop client reuse."""
+    graph = GraphBuilder()
+
+    if USE_LOCAL_AGENTS:
+        analyzer_remote_agent = A2AAgent(endpoint="http://localhost:9002", name=ANALYZER_AGENT_NAME)
+        summarizer_remote_agent = A2AAgent(endpoint="http://localhost:9003", name=SUMMARIZER_AGENT_NAME)
+    else:
+        analyzer_ep = ENDPOINTS.get("analyzer")
+        summarizer_ep = ENDPOINTS.get("summarizer")
+        if not analyzer_ep or not summarizer_ep:
+            raise RuntimeError(
+                "Agent endpoints are not initialized. Ensure registry resolution completed at startup."
+            )
+
+        analyzer_httpx_client = _make_sigv4_async_client()
+        summarizer_httpx_client = _make_sigv4_async_client()
+
+        analyzer_remote_agent = A2AAgent(
+            endpoint=analyzer_ep,
+            name=ANALYZER_AGENT_NAME,
+            client_config=ClientConfig(httpx_client=analyzer_httpx_client),
         )
-        # Extract the default variant
-        return response.get('variants', [{}])[0]
-    except Exception as e:
-        logger.error(f"Failed to fetch prompt from Bedrock Prompt Management: {e}")
-        raise
-
-async def invoke_with_prompt_caching(prompt_config: dict, user_input: str, fallback_model_id: str = "anthropic.claude-3-haiku-20240307-v1:0") -> str:
-    """
-    Invokes the Bedrock Runtime converse API using the fetched prompt configuration.
-    Passes along the cache checkpoints to leverage Bedrock's Prompt Caching feature.
-    """
-    try:
-        system_prompts = []
-        
-        # 1. Parse the template configuration to map system prompts and cache points
-        if 'templateConfiguration' in prompt_config:
-            if 'chat' in prompt_config['templateConfiguration']:
-                system_blocks = prompt_config['templateConfiguration']['chat'].get('system', [])
-                for block in system_blocks:
-                    # Directly append blocks; the API accepts {"text": "..."} and {"cachePoint": {"type": "default"}}
-                    system_prompts.append(block)
-            elif 'text' in prompt_config['templateConfiguration']:
-                # Fallback for simple text templates without specific cache points
-                system_prompts.append({
-                    "text": prompt_config['templateConfiguration']['text'].get('text', '')
-                })
-
-        # 2. Structure the dynamic user input
-        messages = [{
-            "role": "user",
-            "content": [{"text": user_input}]
-        }]
-
-        # 3. Apply inference configurations defined in Prompt Management
-        inference_config = prompt_config.get('inferenceConfiguration', {}).get('text', {})
-        model_id = prompt_config.get('modelId', fallback_model_id)
-
-        # 4. Execute Converse API with the cached definitions
-        logger.info(f"Invoking model {model_id} with prompt caching enabled...")
-        response = await asyncio.to_thread(
-            bedrock_runtime_client.converse,
-            modelId=model_id,
-            system=system_prompts,
-            messages=messages,
-            inferenceConfig={
-                "maxTokens": inference_config.get('maxTokens', 1024),
-                "temperature": inference_config.get('temperature', 0.7),
-                "topP": inference_config.get('topP', 0.9)
-            }
+        summarizer_remote_agent = A2AAgent(
+            endpoint=summarizer_ep,
+            name=SUMMARIZER_AGENT_NAME,
+            client_config=ClientConfig(httpx_client=summarizer_httpx_client),
         )
-        
-        # 5. Log token usage to verify cache hits
-        usage = response.get('usage', {})
-        logger.info(f"Token Usage -> Input (Total): {usage.get('inputTokens', 0)} | Output: {usage.get('outputTokens', 0)}")
-        
-        return response['output']['message']['content'][0]['text']
 
-    except Exception as e:
-        logger.error(f"Error during cached model invocation: {e}")
-        raise
+    graph.add_node(analyzer_remote_agent, ANALYSIS_NODE)
+    graph.add_node(summarizer_remote_agent, SUMMARY_NODE)
+    graph.add_edge(ANALYSIS_NODE, SUMMARY_NODE)
+    graph.set_entry_point(ANALYSIS_NODE)
+    return graph.build()
 
-async def process_orchestrator_request(user_input: str):
+
+# ==========================
+# Tool Definitions
+# ==========================
+
+
+@tool
+def execute_incident_analysis_pipeline(incident_details: str) -> str:
     """
-    Main orchestration function to fetch the managed prompt and execute it using cache optimization.
+    Invokes the internal multi-agent graph pipeline to route incident logs 
+    sequentially through remote AWS cloud nodes and return a structured summary.
     """
-    prompt_config = await fetch_managed_prompt(AWS_PROMPT_ID, AWS_PROMPT_VERSION)
-    result = await invoke_with_prompt_caching(prompt_config, user_input)
+    logger.info("Received incident details for processing. Invoking multi-agent analysis pipeline...")
+    current_span = trace.get_current_span()
+    span_context = current_span.get_span_context()
+    trace_id = format(span_context.trace_id, "032x")
+    logger.info("Processing request. trace_id=%s", trace_id)
+
+    compiled_incident_graph = build_incident_graph()
+    result = compiled_incident_graph(incident_details)
+    logger.info("Pipeline result ready")
     return result
 
+# ========================================================
+#  5. DEFINE THE MASTER ORCHESTRATOR INTERFACE AGENT
+# ========================================================
+
+bedrock_agent_client = aws_session.client('bedrock-agent')
+
+def get_bedrock_system_prompt(prompt_id: str, prompt_version: str, **variables) -> str:
+    """
+    Fetches the system prompt text from AWS Bedrock using a retry mechanism.
+    Injects dynamic variables into the prompt text.
+    """
+    if not prompt_id:
+        logger.warning("AWS_PROMPT_ID is not set. Returning empty configuration.")
+        return ""
+
+    max_retries = 3
+    for attempt in range(1, max_retries + 1):
+        try:
+            logger.info(f"Attempting to fetch configuration from Bedrock (ID: {prompt_id}, Version: {prompt_version}) - Try {attempt}")
+            
+            response = bedrock_agent_client.get_prompt(
+                promptIdentifier=prompt_id,
+                promptVersion=prompt_version
+            )
+            
+            variants = response.get("variants", [])
+            if not variants:
+                logger.error(f"No variants found for prompt {prompt_id}.")
+                return ""
+                
+            template_config = variants[0].get("templateConfiguration", {})
+            prompt_text = template_config.get("text", {}).get("text", "")
+
+            if not prompt_text:
+                logger.error(f"Prompt text is empty in the response.")
+                return ""
+
+            # Inject dynamic variables
+            for key, value in variables.items():
+                prompt_text = prompt_text.replace(f"{{{{{key}}}}}", str(value))
+
+            logger.info(f"Successfully fetched prompt from Bedrock prompt management '{prompt_text}")
+            
+            return prompt_text
+
+        except Exception as e:
+            if attempt < max_retries:
+                logger.warning(f"Attempt {attempt} failed due to error: {e}. Retrying in 2 seconds...")
+                time.sleep(2)
+            else:
+                logger.error(f"Failed to fetch configuration from Bedrock after {max_retries} attempts due to error: {e}.")
+                return {"prompt_text": "", "model_settings": {}}
+
+# Define dynamic variables based on environment and constants
+dynamic_prompt_variables = {
+    "environment":  "prod",
+    "target_audience": "Engineers",
+    "timeout_seconds": str(DEFAULT_TIMEOUT)
+}
+
+# Fetch the system prompt
+SYSTEM_PROMPT = get_bedrock_system_prompt(
+    prompt_id=AWS_PROMPT_ID,
+    prompt_version=AWS_PROMPT_VERSION,
+    **dynamic_prompt_variables
+)
+
+orchestrator_agent = Agent(
+    name="IncidentOrchestrator",
+    description="Orchestrates the incident analysis pipeline and returns structured insights.",
+    system_prompt=SYSTEM_PROMPT,
+    tools=[execute_incident_analysis_pipeline],
+    model=load_model()
+)
+
+
+# ==========================
+# Application Entry Point
+# ==========================
+
+def main():
+    global ENDPOINTS
+
+    if not USE_LOCAL_AGENTS:
+        logger.info("Resolving agent endpoints from registry at startup...")
+        analyzer_ep, summarizer_ep = _resolve_endpoints_with_retry()
+        ENDPOINTS["analyzer"] = analyzer_ep
+        ENDPOINTS["summarizer"] = summarizer_ep
+        
+        print(f"Resolved endpoints: analyzer={analyzer_ep}, summarizer={summarizer_ep}")
+
+    if IS_LOCAL:
+        logger.info("Running orchestrator locally on port 9001")
+        a2a_server = A2AServer(
+            agent=orchestrator_agent,
+            port=9001
+        )
+        a2a_server.serve()
+    else:
+        logger.info("Running orchestrator in production (AgentCore)")
+        executor = StrandsA2AExecutor(agent=orchestrator_agent)
+        serve_a2a(executor)
+
+if __name__ == "__main__":
+    main()
