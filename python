@@ -1,42 +1,115 @@
-from strands.hooks import AfterInvocationEvent
+@tool
+def knowledge_base_search(query: str) -> str:
+    """Search the Bedrock knowledge base and return structured KB records."""
 
-# ========================================================
-# LOGGING METRICS (Strictly Per-Request)
-# ========================================================
-def log_metrics_on_complete(event: AfterInvocationEvent) -> None:
-    """Triggered automatically by Strands strictly for the current HTTP request."""
-    
-    if not event.result or not event.result.metrics:
-        return
-
-    # Extract metrics ONLY for the single, latest request invocation
-    if event.result.metrics.agent_invocations:
-        latest_invocation = event.result.metrics.agent_invocations[-1]
-        metrics = latest_invocation.usage
-        cycle_count = len(latest_invocation.cycles)
-    else:
-        metrics = event.result.metrics.accumulated_usage
-        cycle_count = 1
-
-    input_t = metrics.get('inputTokens', 0)
-    output_t = metrics.get('outputTokens', 0)
-    cache_w = metrics.get('cacheWriteInputTokens', 0)
-    cache_r = metrics.get('cacheReadInputTokens', 0)
-    total_tokens = metrics.get('totalTokens', 0)
-
-    dashboard = (
-        f"\n"
-        f"┌──────────────────────────────────────────────────┐\n"
-        f"│ 📊 ANALYZER SINGLE-REQUEST METRICS               │\n"
-        f"├──────────────────────────────────────────────────┤\n"
-        f"│ 🔄 Agent Cycles    : {cycle_count}\n"
-        f"│ 📥 Standard Input  : {input_t} tokens\n"
-        f"│ 📤 Output Generated: {output_t} tokens\n"
-        f"│ 💾 Cache Written   : {cache_w} tokens\n"
-        f"│ ⚡ Cache Read      : {cache_r} tokens (Discounted!)\n"
-        f"├──────────────────────────────────────────────────┤\n"
-        f"│ 📈 Total Processed : {total_tokens} tokens\n"
-        f"└──────────────────────────────────────────────────┘\n"
+    logger.info(
+        "Executing knowledge_base_search tool. Query: '%s'",
+        query
     )
-    
-    logger.info(dashboard)
+
+    kb_id = os.getenv("KNOWLEDGE_BASE_ID", "")
+    region = os.getenv("AWS_REGION", "us-east-1")
+
+    if not kb_id:
+        logger.error("KNOWLEDGE_BASE_ID is missing")
+        return json.dumps(
+            {
+                "record_count": 0,
+                "records": [],
+                "error": "KNOWLEDGE_BASE_ID not configured"
+            }
+        )
+
+    tool_input = {
+        "toolUseId": "kb-search",
+        "input": {
+            "text": query,
+            "knowledgeBaseId": kb_id,
+            "region": region,
+            "numberOfResults": 5,
+            "score": 0.35,
+        },
+    }
+
+    try:
+        response = _kb_retrieve_fn(tool_input)
+
+        #logger.info("[KB_RAW_RESPONSE] %s", response)
+
+        status = response.get("status", "error")
+        content = response.get("content", [])
+
+        logger.info(
+            "[KB_CONTENT_COUNT] %s",
+            len(content)
+        )
+
+        if status != "success" or not content:
+            return json.dumps(
+                {
+                    "record_count": 0,
+                    "records": []
+                }
+            )
+
+        kb_text = content[0].get("text", "")
+
+        # Extract KB incidents - UPDATED REGEX LOGIC
+        incident_ids = re.findall(
+            r"Incident ID:\s*(INC\d+)",
+            kb_text,
+            flags=re.IGNORECASE
+        )
+
+        summaries = re.findall(
+            r"Summary:\s*(.*?)(?=\n\s*(?:Description|Resolution|Score):?|$)",
+            kb_text,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+
+        resolutions = re.findall(
+            r"Resolution:\s*(.*?)(?=\n\s*(?:Score|Incident ID):?|$)",
+            kb_text,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+
+        records = []
+
+        for idx, incident_id in enumerate(incident_ids):
+            records.append(
+                {
+                    "incident_id": incident_id,
+                    "summary": (
+                        summaries[idx].strip()
+                        if idx < len(summaries)
+                        else ""
+                    ),
+                    "resolution": (
+                        resolutions[idx].strip()
+                        if idx < len(resolutions)
+                        else ""
+                    ),
+                }
+            )
+
+        structured_response = {
+            "record_count": len(records),
+            "records": records,
+        }
+
+        #logger.info("[KB_STRUCTURED_RESPONSE] %s", structured_response)
+
+        return json.dumps(structured_response)
+
+    except Exception as e:
+        logger.exception(
+            "Error in knowledge_base_search"
+        )
+
+        return json.dumps(
+            {
+                "record_count": 0,
+                "records": [],
+                "error": str(e),
+            }
+        )
