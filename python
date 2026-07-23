@@ -1,439 +1,219 @@
-import os
-import logging
-import asyncio
-import time
-import boto3
-import httpx
-from model.load import load_model
-from pydantic import BaseModel, Field
-from botocore.auth import SigV4Auth
-from botocore.awsrequest import AWSRequest
-from a2a.client import ClientConfig
-from opentelemetry import trace, propagate
-
-from strands import Agent
-from strands.multiagent import GraphBuilder
-from strands.tools import tool
-from strands.multiagent.a2a.executor import StrandsA2AExecutor
-from strands.multiagent.a2a import A2AServer
-from bedrock_agentcore.runtime import serve_a2a
-from strands.agent.a2a_agent import A2AAgent
-from dotenv import load_dotenv
-from registry.registry_resolver import resolve_agent_endpoint
-from strands.hooks import AfterInvocationEvent
-import hashlib
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-logging.getLogger("strands.telemetry.metrics").setLevel(logging.INFO)
-
-load_dotenv()
-
-# ==========================
-# Configuration
-# ==========================
-DEFAULT_TIMEOUT = 300  # 5 minutes
-REGISTRY_MAX_RETRIES = int(os.getenv("REGISTRY_MAX_RETRIES", "3"))
-REGISTRY_RETRY_DELAY = float(os.getenv("REGISTRY_RETRY_DELAY", "2.0"))
-AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
-REGISTRY_ID = os.getenv("REGISTRY_ID", "uMicfmSaX3weY0Ca")
-
-SUMMARIZER_SEARCH_QUERY = os.getenv("SUMMARIZER_SEARCH_QUERY", "SummarizerAgent")
-ANALYZER_SEARCH_QUERY = "Find an Agent which is used for analyzing incidents. It should be capable for searching servicenow and knowledge base relavant information."
-
-
-# Runtime flags (normalized once)
-_ENV = os.getenv("ENV", "prod")
-IS_LOCAL = _ENV.upper() == "LOCAL"  # controls serving mode (A2AServer vs serve_a2a)
-_USE_LOCAL_AGENTS = os.getenv("USE_LOCAL_AGENTS", "True")
-USE_LOCAL_AGENTS = _USE_LOCAL_AGENTS.strip().upper() == "TRUE"  # controls downstream endpoints
-
-
-# ==========================
-# AWS Auth
-# ==========================
-# Initialize AWS Session early to allow SSM parameter loading
-aws_session = boto3.Session(region_name=AWS_REGION)
-ssm_client = aws_session.client('ssm')
-
-def get_ssm_parameter(param_path: str, fallback_env: str) -> str:
-    """Fetches a configuration value from AWS SSM Parameter Store with an env fallback."""
-    try:
-        response = ssm_client.get_parameter(Name=param_path, WithDecryption=False)
-        return response['Parameter']['Value']
-    except Exception as e:
-        logger.debug(f"SSM path {param_path} not found or inaccessible ({e}). Falling back to environment variable.")
-        return os.getenv(fallback_env, "")
-
-AWS_PROMPT_ID = get_ssm_parameter("/config/orchestrator_agent/prompt_id", "AWS_PROMPT_ID")
-AWS_PROMPT_VERSION = get_ssm_parameter("/config/orchestrator_agent/prompt_version", "AWS_PROMPT_VERSION")
-
-class SigV4HTTPXAuth(httpx.Auth):
-    """HTTPX Auth class that signs requests with AWS SigV4."""
-
-    def __init__(self, credentials, service: str, region: str):
-        self.credentials = credentials
-        self.service = service
-        self.region = region
-        self.signer = SigV4Auth(credentials, service, region)
-
-    def auth_flow(self, request: httpx.Request):
-        """Signs the request with SigV4 and adds the signature to the request headers."""
-        headers = dict(request.headers)
-        headers.pop("connection", None)  # Remove connection header for signature
-
-        aws_request = AWSRequest(
-            method=request.method,
-            url=str(request.url),
-            data=request.content,
-            headers=headers,
-        )
-
-        self.signer.add_auth(aws_request)
-        request.headers.update(dict(aws_request.headers))
-
-        yield request
-
-aws_session = boto3.Session(region_name=AWS_REGION)
-
-# Endpoint container (single mutable structure instead of multiple globals)
-ENDPOINTS = {"analyzer": None, "summarizer": None}
-
+/home/vuniyal/git/orchestratoragent_agent/app/agent/.venv/lib/python3.12/site-packages/a2a/server/request_handlers/default_request_handler.py:196: UserWarning: The default A2A response stream implemented in the strands sdk does not conform to what is expected in the A2A spec. Please set the `enable_a2a_compliant_streaming` boolean to `True` on your `A2AServer` class to properly conform to the spec. In the next major version release, this will be the default behavior.
+  await self.agent_executor.execute(request, queue)
+2026-07-23 15:41:36,212 [INFO] Creating Strands MetricsClient
+
+Tool #1: execute_incident_analysis_pipeline
+2026-07-23 15:41:39,580 [INFO] Received incident details for processing. Invoking multi-agent analysis pipeline...
+2026-07-23 15:41:39,580 [INFO] Processing request. trace_id=00000000000000000000000000000000
+2026-07-23 15:41:39,581 [WARNING] Graph without execution limits may run indefinitely if cycles exist
+2026-07-23 15:41:39,663 [INFO] HTTP Request: GET http://localhost:9002/.well-known/agent-card.json "HTTP/1.1 200 OK"
+2026-07-23 15:41:39,663 [INFO] Successfully fetched agent card data from http://localhost:9002/.well-known/agent-card.json: {'capabilities': {'streaming': True}, 'defaultInputModes': ['text'], 'defaultOutputModes': ['text'], 'description': 'Provides insight on incident data.', 'name': 'Analyzer Agent', 'preferredTransport': 'JSONRPC', 'protocolVersion': '0.3.0', 'skills': [{'description': 'dynamic_tool', 'id': 'create_incident', 'name': 'create_incident', 'tags': []}, {'description': 'dynamic_tool', 'id': 'get_incident', 'name': 'get_incident', 'tags': []}, {'description': 'dynamic_tool', 'id': 'update_incident', 'name': 'update_incident', 'tags': []}, {'description': 'dynamic_tool', 'id': 'delete_incident', 'name': 'delete_incident', 'tags': []}, {'description': 'dynamic_tool', 'id': 'search_incidents', 'name': 'search_incidents', 'tags': []}, {'description': 'Search the Bedrock knowledge base and return structured KB records.', 'id': 'knowledge_base_search', 'name': 'knowledge_base_search', 'tags': []}], 'url': 'http://127.0.0.1:9002/', 'version': '0.0.1'}
+2026-07-23 15:41:39,684 [INFO] HTTP Request: POST http://127.0.0.1:9002/ "HTTP/1.1 200 OK"
+2026-07-23 15:41:39,699 [INFO] New task created with id: 63b0dc5d-fc90-4f37-92a2-21cc117d7912
+2026-07-23 15:42:18,004 [INFO] HTTP Request: GET http://localhost:9003/.well-known/agent-card.json "HTTP/1.1 200 OK"
+2026-07-23 15:42:18,004 [INFO] Successfully fetched agent card data from http://localhost:9003/.well-known/agent-card.json: {'capabilities': {'streaming': True}, 'defaultInputModes': ['text'], 'defaultOutputModes': ['text'], 'description': 'Provides an immediate specialist summary on incident data.', 'name': 'Summarizer Agent', 'preferredTransport': 'JSONRPC', 'protocolVersion': '0.3.0', 'skills': [], 'url': 'http://127.0.0.1:9003/', 'version': '0.0.1'}
+2026-07-23 15:42:18,033 [INFO] HTTP Request: POST http://127.0.0.1:9003/ "HTTP/1.1 200 OK"
+2026-07-23 15:42:18,040 [INFO] New task created with id: 79c9269e-6ab0-4219-9f3a-131d81548fc5
+2026-07-23 15:42:22,974 [INFO] [ANALYZER_OUTPUT] {"incident_count":0,"incidents":[],"knowledge_base_record_count":5,"knowledge_base_insights":[{"incident_id":"INC000036787200","summary":"*DAA* Intermitted Loss of All Services | MI172 | Middletown Hub","resolution":"Gary Bell MT3 agreed field issue. There is no light hitting hub. OSP is sending out new pigtail, and setting up OTDR"},{"incident_id":"INC000036573325","summary":"Worcester, MA | Multiple Nodes | Loss of all services","resolution":"failed back to primary card. Customers recovered"},{"incident_id":"INC000036520458","summary":"ROC to NOC - Impacting Escalation - DAA Node What is the reason for referral? RPD was activated 1 day ago - had lower frequencies at activation - is now missing everything below 454MHz Specify the support requested: Troubleshooting missing frequencies on recent RPD install RPD Node Type: Harmonic Node Segmentation: 1x2 Node Enclosure: EN9000 FWD RF Level EIA 34: FWD RF Level EIA 64: RTN TX Level:37 If Node Segmentation 2x2 or 2x4 - Is Issue Seen On Both Sides: No Has the RPD Been Replaced? Yes Additional Information for Video Operations: RPD was previously replaced due to it not being able to activate - clock was not sy Is this a single RPD/Service Group issue, or multiple: Single Video Service Type Impacted: ALL Live Example, STB experiencing Issue: (MAC or U/A)BC3E074AC7A8 POC: 6032047927 - Craig Geoffrey MA: NE Hub: WAKEFIELD : WK Node(s): WK067","resolution":"RFIT Process not complete."},{"incident_id":"INC000036688122","summary":"MT POC for ISP to contact? ROC to NOC - Dual Dispatch - Multiple Nodes What is customer impact? All services Offline List impacted node(s): WK075, WK077, WK085, WK074, WK067, WK094, WK070, WK093, WK073, WK083, WK096, WK092, WK084, WK081, WK078, WK061, WK069, WK086, WK064, WK088, WK097 What does Return Path Monitoring show? Flatlined What is the status of Power Supply? (where available) PS Offline Does IVR in LH show any customer calls from the node? (L-TWC only) Yes Does the local commercial power company website show any outages? No Have supporting screenshots been attached? Yes Has the ROC ticket been related to the NOC ticket? Yes Where did the issue originate? (RSC, Comm Desk, Alarms, MT, etc.) Alarms Name of ROC Sup (or next highest level available) who approved this escalation: Laura Gallegos Has call deflection been set in the ROC ticket? Yes MA: NE Hub: WAKEFIELD : WK Node(s): Multiple Tech: Craig Geoffrey Tech Phone: 6032047927","resolution":"field issue"},{"incident_id":"INC000036719389","summary":"This multi-node incident has been escalated by the ROC. ISP have been dispatched for the NORWICH: NX Hub to investigate a loss of all services affecting multiple nodes NW025A and NW025B. The ROC and OSP remain engaged to continue troubleshooting the HFC plant.","resolution":"field will be doing an OTDR, no otdr request originally requested"}]}
+2026-07-23 15:42:22,976 [ERROR] Failed to extract summary from graph result: 'GraphResult' object has no attribute 'message'
+Traceback (most recent call last):
+  File "/home/vuniyal/git/orchestratoragent_agent/app/agent/main.py", line 255, in execute_incident_analysis_pipeline
+    result.message["content"][0]["text"]
+    ^^^^^^^^^^^^^^
+AttributeError: 'GraphResult' object has no attribute 'message'
+2026-07-23 15:42:22,988 [WARNING] Falling back to raw graph output. Length=26484
+---
+
+## **Incident Analysis Summary**
+
+**Affected Systems:** MW001, MW002  
+**Issue:** Intermittent network reachability outages causing all services to be down
+
+### **Key Findings**
+
+No specific incident records were found for MW001 and MW002 in the current incident database. However, the knowledge base returned **5 similar historical incidents** involving multi-node service outages:
+
+1. **INC000036787200** - Middletown Hub | Loss of All Services  
+   - **Root Cause:** No light hitting hub (fiber issue)  
+   - **Resolution:** Field issue - OSP sent new pigtail and performed OTDR
+
+2. **INC000036573325** - Worcester, MA | Multiple Nodes  
+   - **Root Cause:** Primary card failure  
+   - **Resolution:** Failed back to primary card; customers recovered
+
+3. **INC000036520458** - DAA Node (Wakefield: WK067)  
+   - **Root Cause:** RFIT process incomplete  
+   - **Resolution:** Process completion required
+
+4. **INC000036688122** - Wakefield Hub | 20+ Nodes Offline  
+   - **Root Cause:** Field issue; power supply offline, return path flatlined  
+   - **Resolution:** Escalated to field technicians
+
+5. **INC000036719389** - Norwich Hub | NW025A/B Nodes  
+   - **Root Cause:** HFC plant issue  
+   - **Resolution:** Field performed OTDR for troubleshooting
+
+---
+
+### **Root Cause (Probable)**
+
+Based on similar incidents, intermittent network reachability outages causing all services to fail on MW001 and MW002 are most likely due to:
+- **Physical layer issues** (fiber/optical loss, damaged cables)
+- **Network hardware failure** (cards, power supplies)
+- **HFC plant issues** requiring field investigation
+
+---
+
+### **Recommended Actions**
+
+1. **Immediate:**
+   - Verify power supply status on MW001 and MW002
+   - Check return path monitoring for flatlined signals
+   - Inspect optical signal levels at hub interfaces
+
+2. **Field Dispatch:**
+   - Escalate to field technicians for on-site investigation
+   - Request OTDR (Optical Time-Domain Reflectometer) testing if fiber issues are suspected
+   - Verify physical connectivity (pigtails, fiber connections)
+
+3. **Monitoring:**
+   - Track customer call volumes from affected nodes
+   - Check if issue is isolated to these nodes or part of broader outage
+   - Engage ROC/NOC for dual dispatch if multiple systems are impacted
+
+4. **Recovery:**
+   - Consider failover/failback to backup cards if available
+   - Once root cause identified, implement appropriate fix (replace hardware, repair fiber, complete configuration)
+
+---
+
+**Knowledge Base Records Reviewed:** 5  
+**Incident2026-07-23 15:42:37,502 [INFO] 
+┌──────────────────────────────────────────────────┐
+│ 📊 ANALYZER SINGLE-REQUEST METRICS               │
+├──────────────────────────────────────────────────┤
+│ 🔄 Agent Cycles    : 2
+│ 📥 Standard Input  : 947 tokens
+│ 📤 Output Generated: 756 tokens
+│ 💾 Cache Written   : 9138 tokens
+│ ⚡ Cache Read      : 0 tokens (Discounted!)
+├──────────────────────────────────────────────────┤
+│ 📈 Total Processed : 10841 tokens
+└──────────────────────────────────────────────────┘
+
+ Records Found:** 0INFO:     127.0.0.1:56226 - "POST / HTTP/1.1" 200 OK
 
-# ==========================
-# Registry Resolution
-# ==========================
-
-def _resolve_endpoints_with_retry(
-    max_retries: int = REGISTRY_MAX_RETRIES,
-    retry_delay: float = REGISTRY_RETRY_DELAY,
-) -> tuple[str, str]:
-    """Resolve both agent endpoints from the registry, retrying on transient failures.
-
-    Raises:
-        RuntimeError: If all retry attempts are exhausted.
-    """
-    last_error: Exception | None = None
-    for attempt in range(1, max_retries + 1):
-        try:
-            analyzer_ep = resolve_agent_endpoint(ANALYZER_SEARCH_QUERY, REGISTRY_ID, AWS_REGION)
-            summarizer_ep = resolve_agent_endpoint(SUMMARIZER_SEARCH_QUERY, REGISTRY_ID, AWS_REGION)
-            logger.info("Resolved agent endpoints from registry")
-            return analyzer_ep, summarizer_ep
-        except Exception as exc:
-            last_error = exc
-            if attempt < max_retries:
-                logger.warning(
-                    "Registry lookup failed (attempt %d/%d): %s. Retrying in %.1fs...",
-                    attempt,
-                    max_retries,
-                    exc,
-                    retry_delay,
-                )
-                time.sleep(retry_delay)
-            else:
-                logger.error(
-                    "Registry lookup failed after %d attempts: %s",
-                    max_retries,
-                    exc,
-                )
-    raise RuntimeError(
-        f"Failed to resolve agent endpoints from registry after {max_retries} attempts."
-    ) from last_error
-
-
-# ==========================
-# Graph Construction
-# ==========================
-
-def _make_sigv4_async_client(timeout: int = DEFAULT_TIMEOUT) -> httpx.AsyncClient:
-    """Return a configured AsyncClient signed with SigV4 for Bedrock AgentCore."""
-    creds = aws_session.get_credentials()
-    sigv4_auth = SigV4HTTPXAuth(creds, "bedrock-agentcore", aws_session.region_name)
-    return httpx.AsyncClient(timeout=timeout, auth=sigv4_auth)
-
-
-# Graph node / agent name constants
-ANALYSIS_NODE = "analysis_step"
-SUMMARY_NODE = "summary_step"
-ANALYZER_AGENT_NAME = "analyzer_agent"
-SUMMARIZER_AGENT_NAME = "summarizer_agent"
-
-
-def build_incident_graph():
-    """Create a fresh graph per invocation to avoid cross-event-loop client reuse."""
-    graph = GraphBuilder()
-
-    if USE_LOCAL_AGENTS:
-        analyzer_remote_agent = A2AAgent(endpoint="http://localhost:9002", name=ANALYZER_AGENT_NAME)
-        summarizer_remote_agent = A2AAgent(endpoint="http://localhost:9003", name=SUMMARIZER_AGENT_NAME)
-    else:
-        analyzer_ep = ENDPOINTS.get("analyzer")
-        summarizer_ep = ENDPOINTS.get("summarizer")
-        if not analyzer_ep or not summarizer_ep:
-            raise RuntimeError(
-                "Agent endpoints are not initialized. Ensure registry resolution completed at startup."
-            )
-
-        analyzer_httpx_client = _make_sigv4_async_client()
-        summarizer_httpx_client = _make_sigv4_async_client()
-
-        analyzer_remote_agent = A2AAgent(
-            endpoint=analyzer_ep,
-            name=ANALYZER_AGENT_NAME,
-            client_config=ClientConfig(httpx_client=analyzer_httpx_client),
-        )
-        summarizer_remote_agent = A2AAgent(
-            endpoint=summarizer_ep,
-            name=SUMMARIZER_AGENT_NAME,
-            client_config=ClientConfig(httpx_client=summarizer_httpx_client),
-        )
-
-    graph.add_node(analyzer_remote_agent, ANALYSIS_NODE)
-    graph.add_node(summarizer_remote_agent, SUMMARY_NODE)
-    graph.add_edge(ANALYSIS_NODE, SUMMARY_NODE)
-    graph.set_entry_point(ANALYSIS_NODE)
-    return graph.build()
-
-
-# ==========================
-# Tool Definitions
-# ==========================
-
-
-@tool
-def execute_incident_analysis_pipeline(incident_details: str) -> str:
-    """
-    Invokes the internal multi-agent graph pipeline to route incident logs
-    sequentially through remote AWS cloud nodes and return a structured summary.
-    """
-
-    logger.info(
-        "Received incident details for processing. Invoking multi-agent analysis pipeline..."
-    )
-
-    current_span = trace.get_current_span()
-    span_context = current_span.get_span_context()
-    trace_id = format(span_context.trace_id, "032x")
-
-    logger.info("Processing request. trace_id=%s", trace_id)
-
-    # Build and execute graph
-    compiled_incident_graph = build_incident_graph()
-    result = compiled_incident_graph(incident_details)
-
-    analysis_text = (
-        result.results[ANALYSIS_NODE]
-        .result
-        .message["content"][0]["text"]
-        )
-
-    logger.info(
-        "[ANALYZER_OUTPUT] %s",
-        analysis_text
-    )
-
-    analysis_hash = hashlib.sha256(
-        analysis_text.encode("utf-8")
-        ).hexdigest()
-
-    logger.debug(
-        "[ORCH_ANALYSIS_HASH] %s",
-        analysis_hash,
-        )
-
-    try:
-        # Extract ONLY the summarizer business response
-        summary_text = (
-            result.results[SUMMARY_NODE]
-            .result
-            .message["content"][0]["text"]
-        )
-
-        logger.info(
-                "[FINAL_ANALYZER_RESPONSE] %s",
-                result.message["content"][0]["text"]
-            )
-
-        summary_hash = hashlib.sha256(
-            summary_text.encode("utf-8")
-            ).hexdigest()
-
-        logger.info(
-            "[ORCHESTRATOR_TOOL_OUTPUT] hash=%s len=%d",
-            summary_hash,
-            len(summary_text)
-        )
-
-        logger.info(
-            "Pipeline summary generated. Characters=%s",
-            len(summary_text),
-        )
-
-        return summary_text
-
-    except Exception as e:
-        logger.exception(
-            "Failed to extract summary from graph result: %s",
-            str(e),
-        )
-
-        fallback_text = str(result)
-
-        logger.warning(
-            "Falling back to raw graph output. Length=%s",
-            len(fallback_text),
-        )
-
-        return fallback_text
-
-# ========================================================
-#  5. DEFINE THE MASTER ORCHESTRATOR INTERFACE AGENT
-# ========================================================
-
-bedrock_agent_client = aws_session.client('bedrock-agent')
-
-def get_bedrock_system_prompt(prompt_id: str, prompt_version: str, **variables) -> str:
-    """
-    Fetches the system prompt text from AWS Bedrock using a retry mechanism.
-    Injects dynamic variables into the prompt text.
-    """
-    if not prompt_id:
-        logger.warning("AWS_PROMPT_ID is not set. Returning empty configuration.")
-        return ""
-
-    max_retries = 3
-    for attempt in range(1, max_retries + 1):
-        try:
-            logger.info(f"Attempting to fetch configuration from Bedrock (ID: {prompt_id}, Version: {prompt_version}) - Try {attempt}")
-            
-            response = bedrock_agent_client.get_prompt(
-                promptIdentifier=prompt_id,
-                promptVersion=prompt_version
-            )
-            
-            variants = response.get("variants", [])
-            if not variants:
-                logger.error(f"No variants found for prompt {prompt_id}.")
-                return ""
-                
-            template_config = variants[0].get("templateConfiguration", {})
-            prompt_text = template_config.get("text", {}).get("text", "")
-
-            if not prompt_text:
-                logger.error(f"Prompt text is empty in the response.")
-                return ""
-
-            # Inject dynamic variables
-            for key, value in variables.items():
-                prompt_text = prompt_text.replace(f"{{{{{key}}}}}", str(value))
-
-            logger.info(f"Successfully fetched prompt from Bedrock prompt management '{prompt_text}")
-            
-            return prompt_text
-
-        except Exception as e:
-            if attempt < max_retries:
-                logger.warning(f"Attempt {attempt} failed due to error: {e}. Retrying in 2 seconds...")
-                time.sleep(2)
-            else:
-                logger.error(f"Failed to fetch configuration from Bedrock after {max_retries} attempts due to error: {e}.")
-                return {"prompt_text": "", "model_settings": {}}
-
-# Define dynamic variables based on environment and constants
-dynamic_prompt_variables = {
-    "environment":  "prod",
-    "target_audience": "Engineers",
-    "timeout_seconds": str(DEFAULT_TIMEOUT)
-}
-
-# Fetch the system prompt
-SYSTEM_PROMPT = get_bedrock_system_prompt(
-    prompt_id=AWS_PROMPT_ID,
-    prompt_version=AWS_PROMPT_VERSION,
-    **dynamic_prompt_variables
-)
-
-# ========================================================
-# LOGGING METRICS (Strictly Per-Request)
-# ========================================================
-def log_metrics_on_complete(event: AfterInvocationEvent) -> None:
-    """Triggered automatically by Strands strictly for the current HTTP request."""
-    
-    if not event.result or not event.result.metrics:
-        return
-
-    # Extract metrics ONLY for the single, latest request invocation
-    if event.result.metrics.agent_invocations:
-        latest_invocation = event.result.metrics.agent_invocations[-1]
-        metrics = latest_invocation.usage
-        cycle_count = len(latest_invocation.cycles)
-    else:
-        metrics = event.result.metrics.accumulated_usage
-        cycle_count = 1
-
-    input_t = metrics.get('inputTokens', 0)
-    output_t = metrics.get('outputTokens', 0)
-    cache_w = metrics.get('cacheWriteInputTokens', 0)
-    cache_r = metrics.get('cacheReadInputTokens', 0)
-    total_tokens = metrics.get('totalTokens', 0)
-
-    # Calculate actual billed tokens
-    billed_tokens = (input_t + output_t) - cache_r
-
-    dashboard = (
-        f"\n"
-        f"┌──────────────────────────────────────────────────┐\n"
-        f"│ 📊 ANALYZER SINGLE-REQUEST METRICS               │\n"
-        f"├──────────────────────────────────────────────────┤\n"
-        f"│ 🔄 Agent Cycles    : {cycle_count}\n"
-        f"│ 📥 Standard Input  : {input_t} tokens\n"
-        f"│ 📤 Output Generated: {output_t} tokens\n"
-        f"│ 💾 Cache Written   : {cache_w} tokens\n"
-        f"│ ⚡ Cache Read      : {cache_r} tokens (Discounted!)\n"
-        f"├──────────────────────────────────────────────────┤\n"
-        f"│ 📈 Total Processed : {total_tokens} tokens\n"
-        f"└──────────────────────────────────────────────────┘\n"
-    )
-    
-    logger.info(dashboard)
-
-orchestrator_agent = Agent(
-    name="IncidentOrchestrator",
-    description="Orchestrates the incident analysis pipeline and returns structured insights.",
-    system_prompt=SYSTEM_PROMPT,
-    tools=[execute_incident_analysis_pipeline],
-    model=load_model()
-)
-
-orchestrator_agent.add_hook(log_metrics_on_complete, AfterInvocationEvent)
-
-# ==========================
-# Application Entry Point
-# ==========================
-
-def main():
-    global ENDPOINTS
-
-    if not USE_LOCAL_AGENTS:
-        logger.info("Resolving agent endpoints from registry at startup...")
-        analyzer_ep, summarizer_ep = _resolve_endpoints_with_retry()
-        ENDPOINTS["analyzer"] = analyzer_ep
-        ENDPOINTS["summarizer"] = summarizer_ep
-        
-        print(f"Resolved endpoints: analyzer={analyzer_ep}, summarizer={summarizer_ep}")
-
-    if IS_LOCAL:
-        logger.info("Running orchestrator locally on port 9001")
-        a2a_server = A2AServer(
-            agent=orchestrator_agent,
-            port=9001
-        )
-        a2a_server.serve()
-    else:
-        logger.info("Running orchestrator in production (AgentCore)")
-        executor = StrandsA2AExecutor(agent=orchestrator_agent)
-        serve_a2a(executor)
-
-if __name__ == "__main__":
-    main()
+Tool #2: execute_incident_analysis_pipeline
+2026-07-23 15:43:02,101 [INFO] Received incident details for processing. Invoking multi-agent analysis pipeline...
+2026-07-23 15:43:02,101 [INFO] Processing request. trace_id=00000000000000000000000000000000
+2026-07-23 15:43:02,102 [WARNING] Graph without execution limits may run indefinitely if cycles exist
+2026-07-23 15:43:02,118 [INFO] HTTP Request: GET http://localhost:9002/.well-known/agent-card.json "HTTP/1.1 200 OK"
+2026-07-23 15:43:02,119 [INFO] Successfully fetched agent card data from http://localhost:9002/.well-known/agent-card.json: {'capabilities': {'streaming': True}, 'defaultInputModes': ['text'], 'defaultOutputModes': ['text'], 'description': 'Provides insight on incident data.', 'name': 'Analyzer Agent', 'preferredTransport': 'JSONRPC', 'protocolVersion': '0.3.0', 'skills': [{'description': 'dynamic_tool', 'id': 'create_incident', 'name': 'create_incident', 'tags': []}, {'description': 'dynamic_tool', 'id': 'get_incident', 'name': 'get_incident', 'tags': []}, {'description': 'dynamic_tool', 'id': 'update_incident', 'name': 'update_incident', 'tags': []}, {'description': 'dynamic_tool', 'id': 'delete_incident', 'name': 'delete_incident', 'tags': []}, {'description': 'dynamic_tool', 'id': 'search_incidents', 'name': 'search_incidents', 'tags': []}, {'description': 'Search the Bedrock knowledge base and return structured KB records.', 'id': 'knowledge_base_search', 'name': 'knowledge_base_search', 'tags': []}], 'url': 'http://127.0.0.1:9002/', 'version': '0.0.1'}
+2026-07-23 15:43:02,149 [INFO] HTTP Request: POST http://127.0.0.1:9002/ "HTTP/1.1 200 OK"
+2026-07-23 15:43:02,156 [INFO] New task created with id: 9229e710-b5fc-4ddd-9dc6-5ffac81c0358
+2026-07-23 15:43:37,771 [INFO] HTTP Request: GET http://localhost:9003/.well-known/agent-card.json "HTTP/1.1 200 OK"
+2026-07-23 15:43:37,771 [INFO] Successfully fetched agent card data from http://localhost:9003/.well-known/agent-card.json: {'capabilities': {'streaming': True}, 'defaultInputModes': ['text'], 'defaultOutputModes': ['text'], 'description': 'Provides an immediate specialist summary on incident data.', 'name': 'Summarizer Agent', 'preferredTransport': 'JSONRPC', 'protocolVersion': '0.3.0', 'skills': [], 'url': 'http://127.0.0.1:9003/', 'version': '0.0.1'}
+2026-07-23 15:43:37,794 [INFO] HTTP Request: POST http://127.0.0.1:9003/ "HTTP/1.1 200 OK"
+2026-07-23 15:43:37,798 [INFO] New task created with id: 51073ea4-ec5c-4a96-8354-5f1f321b612f
+2026-07-23 15:43:41,542 [INFO] [ANALYZER_OUTPUT] {"incident_count":0,"incidents":[],"knowledge_base_record_count":5,"knowledge_base_insights":[{"incident_id":"INC000036787200","summary":"*DAA* Intermitted Loss of All Services | MI172 | Middletown Hub","resolution":"Gary Bell MT3 agreed field issue. There is no light hitting hub. OSP is sending out new pigtail, and setting up OTDR"},{"incident_id":"INC000036573325","summary":"Worcester, MA | Multiple Nodes | Loss of all services","resolution":"failed back to primary card. Customers recovered"},{"incident_id":"INC000036520458","summary":"ROC to NOC - Impacting Escalation - DAA Node What is the reason for referral? RPD was activated 1 day ago - had lower frequencies at activation - is now missing everything below 454MHz Specify the support requested: Troubleshooting missing frequencies on recent RPD install RPD Node Type: Harmonic Node Segmentation: 1x2 Node Enclosure: EN9000 FWD RF Level EIA 34: FWD RF Level EIA 64: RTN TX Level:37 If Node Segmentation 2x2 or 2x4 - Is Issue Seen On Both Sides: No Has the RPD Been Replaced? Yes Additional Information for Video Operations: RPD was previously replaced due to it not being able to activate - clock was not sy Is this a single RPD/Service Group issue, or multiple: Single Video Service Type Impacted: ALL Live Example, STB experiencing Issue: (MAC or U/A)BC3E074AC7A8 POC: 6032047927 - Craig Geoffrey MA: NE Hub: WAKEFIELD : WK Node(s): WK067","resolution":"RFIT Process not complete."},{"incident_id":"INC000036688122","summary":"MT POC for ISP to contact? ROC to NOC - Dual Dispatch - Multiple Nodes What is customer impact? All services Offline List impacted node(s): WK075, WK077, WK085, WK074, WK067, WK094, WK070, WK093, WK073, WK083, WK096, WK092, WK084, WK081, WK078, WK061, WK069, WK086, WK064, WK088, WK097 What does Return Path Monitoring show? Flatlined What is the status of Power Supply? (where available) PS Offline Does IVR in LH show any customer calls from the node? (L-TWC only) Yes Does the local commercial power company website show any outages? No Have supporting screenshots been attached? Yes Has the ROC ticket been related to the NOC ticket? Yes Where did the issue originate? (RSC, Comm Desk, Alarms, MT, etc.) Alarms Name of ROC Sup (or next highest level available) who approved this escalation: Laura Gallegos Has call deflection been set in the ROC ticket? Yes MA: NE Hub: WAKEFIELD : WK Node(s): Multiple Tech: Craig Geoffrey Tech Phone: 6032047927","resolution":"field issue"},{"incident_id":"INC000036719389","summary":"This multi-node incident has been escalated by the ROC. ISP have been dispatched for the NORWICH: NX Hub to investigate a loss of all services affecting multiple nodes NW025A and NW025B. The ROC and OSP remain engaged to continue troubleshooting the HFC plant.","resolution":"field will be doing an OTDR, no otdr request originally requested"}]}
+2026-07-23 15:43:41,543 [ERROR] Failed to extract summary from graph result: 'GraphResult' object has no attribute 'message'
+Traceback (most recent call last):
+  File "/home/vuniyal/git/orchestratoragent_agent/app/agent/main.py", line 255, in execute_incident_analysis_pipeline
+    result.message["content"][0]["text"]
+    ^^^^^^^^^^^^^^
+AttributeError: 'GraphResult' object has no attribute 'message'
+2026-07-23 15:43:41,546 [WARNING] Falling back to raw graph output. Length=26484
+---
+
+## Incident Analysis Summary
+
+**Affected Systems:** MW001, MW002
+
+**Issue:** Intermittent network reachability outages causing all services to be down
+
+---
+
+### Key Findings
+
+**Incident Data Status:** No active incidents found in the current system matching MW001, MW002  
+
+**Knowledge Base Records Retrieved:** 5 similar historical incidents
+
+---
+
+### Historical Patterns from Knowledge Base
+
+The analysis identified **5 similar multi-node loss-of-service incidents**:
+
+1. **INC000036787200** - Middletown Hub (MI172)
+   - **Issue:** Intermittent Loss of All Services  
+   - **Root Cause:** Field issue - no light hitting hub (optical connectivity failure)
+   - **Resolution:** OSP sent new pigtail and performed OTDR
+
+2. **INC000036573325** - Worcester, MA (Multiple Nodes)
+   - **Issue:** Loss of all services
+   - **Root Cause:** Card failure
+   - **Resolution:** Failed back to primary card; customers recovered
+
+3. **INC000036688122** - Multiple WAKEFIELD Nodes (20+ nodes)
+   - **Issue:** All services offline  
+   - **Symptoms:** Flatlined return path monitoring, power supply offline
+   - **Root Cause:** Field issue
+   - **Resolution:** Dual dispatch; field investigation
+
+4. **INC000036719389** - NORWICH Hub (NW025A, NW025B)
+   - **Issue:** Loss of all services affecting multiple nodes
+   - **Root Cause:** HFC plant issue
+   - **Resolution:** OTDR investigation by field team
+
+5. **INC000036520458** - WAKEFIELD (WK067)
+   - **Issue:** Frequencies missing below 454MHz
+   - **Root Cause:** RFIT process not complete
+   - **Resolution:** Process completion required
+
+---
+
+### Recommended Actions
+
+Based on similar historical incidents:
+
+1. **Immediate Triage:**
+   - Check optical light levels at MW001 and MW002
+   - Verify power supply status on both nodes
+   - Review return path monitoring for flatlined signals
+
+2. **Field Dispatch:**
+   - Dispatch ISP/OSP for physical inspection
+   - Prepare for potential OTDR testing to identify fiber breaks or optical connectivity issues
+
+3. **Network Equipment Check:**
+   - Verify card status (active vs. standby)
+   - Check for potential failover to backup cards
+   - Confirm RFIT process completion if recent installations occurred
+
+4. **Monitor and Document:**
+   - Capture screenshots of monitoring systems
+   - Track customer impact and call volume
+   - Relate to existing NOC tickets if applicable
+
+5. **Probable Root Causes (prioritized by frequency):**
+   - Optical connectivity failure (pigtail/fiber issue)
+   - Power supply failure
+   - Card/hardware failure
+   - HFC plant issue requiring field investigation
+
+---
+
+**2026-07-23 15:43:55,517 [INFO] 
+┌──────────────────────────────────────────────────┐
+│ 📊 ANALYZER SINGLE-REQUEST METRICS               │
+├──────────────────────────────────────────────────┤
+│ 🔄 Agent Cycles    : 2
+│ 📥 Standard Input  : 947 tokens
+│ 📤 Output Generated: 778 tokens
+│ 💾 Cache Written   : 9152 tokens
+│ ⚡ Cache Read      : 0 tokens (Discounted!)
+├──────────────────────────────────────────────────┤
+│ 📈 Total Processed : 10877 tokens
+└──────────────────────────────────────────────────┘
+
