@@ -1,287 +1,39 @@
-import os
-import logging
-import time
-import boto3
-from dotenv import load_dotenv
-from strands import Agent
-from strands.multiagent.a2a.executor import StrandsA2AExecutor
-from strands.multiagent.a2a import A2AServer
-from bedrock_agentcore.runtime import serve_a2a
-from model.load import load_model
-from strands.hooks import AfterInvocationEvent
-from pydantic import BaseModel, Field
-load_dotenv()
-AWS_REGION = os.getenv("AWS_REGION", "")
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-logging.getLogger("strands.telemetry.metrics").setLevel(logging.INFO)
-
-# Initialize AWS Session early to allow SSM parameter loading
-aws_session = boto3.Session(region_name=AWS_REGION)
-ssm_client = aws_session.client('ssm')
-
-def get_ssm_parameter(param_path: str, fallback_env: str) -> str:
-    """Fetches a configuration value from AWS SSM Parameter Store with an env fallback."""
-    try:
-        response = ssm_client.get_parameter(Name=param_path, WithDecryption=False)
-        return response['Parameter']['Value']
-    except Exception as e:
-        logger.error(f"SSM path {param_path} not found or inaccessible ({e}). Falling back to environment variable.")
-        return os.getenv(fallback_env, "")
-
-AWS_PROMPT_ID = get_ssm_parameter("/config/summarizer_agent/prompt_id", "AWS_PROMPT_ID")
-AWS_PROMPT_VERSION = get_ssm_parameter("/config/summarizer_agent/prompt_version", "AWS_PROMPT_VERSION")
-
-# This specialist does not delegate tasks, keeping tools list empty
-tools = []
-
-bedrock_agent_client = aws_session.client('bedrock-agent')
-
-#fetching system prompt
-def get_bedrock_system_prompt(prompt_id: str, prompt_version: str, **variables) -> str:
-    """
-    Fetches the system prompt and inference configurations from AWS Bedrock using a retry mechanism.
-    Injects dynamic variables into the prompt text.
-    """
-    if not prompt_id:
-        logger.warning("AWS_PROMPT_ID is not set. Returning empty configuration.")
-        return ""
-
-    max_retries = 3
-    for attempt in range(1, max_retries + 1):
-        try:
-            logger.info(f"Attempting to fetch configuration from Bedrock (ID: {prompt_id}, Version: {prompt_version}) - Try {attempt}")
-            
-            response = bedrock_agent_client.get_prompt(
-                promptIdentifier=prompt_id,
-                promptVersion=prompt_version
-            )
-            
-            variants = response.get("variants", [])
-            if not variants:
-                logger.error(f"No variants found for prompt {prompt_id}.")
-                return ""
-                
-            template_config = variants[0].get("templateConfiguration", {})
-            prompt_text = template_config.get("text", {}).get("text", "")
-
-            if not prompt_text:
-                logger.error(f"Prompt text is empty in the response.")
-                return ""
-
-            # Inject dynamic variables
-            for key, value in variables.items():
-                prompt_text = prompt_text.replace(f"{{{{{key}}}}}", str(value))
-
-            logger.info(f"Successfully fetched prompt from Bedrock prompt management: {prompt_text}")
-            return prompt_text
-
-        except Exception as e:
-            if attempt < max_retries:
-                logger.warning(f"Attempt {attempt} failed due to error: {e}. Retrying in 2 seconds...")
-                time.sleep(2)
-            else:
-                logger.error(f"Failed to fetch configuration from Bedrock after {max_retries} attempts due to error: {e}.")
-                return ""
-
-
-# Define dynamic variables based on environment and constants
-dynamic_prompt_variables = {}
-
-# Fetch the combined configuration dictionary
-SYSTEM_PROMPT = get_bedrock_system_prompt(
-    prompt_id=AWS_PROMPT_ID,
-    prompt_version=AWS_PROMPT_VERSION,
-    **dynamic_prompt_variables
-)
-
 class IncidentSummary(BaseModel):
     incident_count: int = Field(
+        default=0,
         description="Total number of incidents"
     )
 
-    affected_systems: str = Field(
+    affected_systems: Optional[str] = Field(
+        default=None,
         description="Alphabetically sorted affected systems"
     )
 
-    categories: str = Field(
+    categories: Optional[str] = Field(
+        default=None,
         description="Alphabetically sorted categories"
     )
 
-    priorities: str = Field(
+    priorities: Optional[str] = Field(
+        default=None,
         description="Sorted priorities"
     )
 
-    states: str = Field(
+    states: Optional[str] = Field(
+        default=None,
         description="Sorted states"
     )
 
-    short_description: str = Field(
+    short_description: Optional[str] = Field(
+        default=None,
         description="Short description copied from first incident"
     )
 
     knowledge_base_record_count: int = Field(
+        default=0,
         description="Number of KB records"
     )
 
     summary_text: str = Field(
         description="Final deterministic summary"
     )
-
-# ========================================================
-# LOGGING METRICS (Strictly Per-Request)
-# ========================================================
-def log_metrics_on_complete(event: AfterInvocationEvent) -> None:
-    """Triggered automatically by Strands strictly for the current HTTP request."""
-    
-    if not event.result or not event.result.metrics:
-        return
-
-    # Extract metrics ONLY for the single, latest request invocation
-    if event.result.metrics.agent_invocations:
-        latest_invocation = event.result.metrics.agent_invocations[-1]
-        metrics = latest_invocation.usage
-        cycle_count = len(latest_invocation.cycles)
-    else:
-        metrics = event.result.metrics.accumulated_usage
-        cycle_count = 1
-
-    input_t = metrics.get('inputTokens', 0)
-    output_t = metrics.get('outputTokens', 0)
-    cache_w = metrics.get('cacheWriteInputTokens', 0)
-    cache_r = metrics.get('cacheReadInputTokens', 0)
-    total_tokens = metrics.get('totalTokens', 0)
-
-    # Calculate actual billed tokens
-    billed_tokens = (input_t + output_t) - cache_r
-
-    dashboard = (
-        f"\n"
-        f"┌──────────────────────────────────────────────────┐\n"
-        f"│ 📊 ANALYZER SINGLE-REQUEST METRICS               │\n"
-        f"├──────────────────────────────────────────────────┤\n"
-        f"│ 🔄 Agent Cycles    : {cycle_count}\n"
-        f"│ 📥 Standard Input  : {input_t} tokens\n"
-        f"│ 📤 Output Generated: {output_t} tokens\n"
-        f"│ 💾 Cache Written   : {cache_w} tokens\n"
-        f"│ ⚡ Cache Read      : {cache_r} tokens (Discounted!)\n"
-        f"├──────────────────────────────────────────────────┤\n"
-        f"│ 📈 Total Processed : {total_tokens} tokens\n"
-        f"└──────────────────────────────────────────────────┘\n"
-    )
-    
-    logger.info(dashboard)
-    
-def main():
-    # Reads environment variable dynamically. Evaluates to True if set to 'local' (case-insensitive)
-    is_local = os.getenv("ENV", "prod").lower() == "local"
-    
-    summarizer_agent = Agent(
-        name="Summarizer Agent",    
-        description="Provides an immediate specialist summary on incident data.", 
-        model=load_model(),
-        system_prompt=SYSTEM_PROMPT,
-        tools=tools,
-        structured_output_model=IncidentSummary,
-    )
-
-    summarizer_agent.add_hook(log_metrics_on_complete, AfterInvocationEvent)
-
-    if is_local:
-        logger.info("Running Summarizer Agent in LOCAL mode on port 9003...")
-        a2a_server = A2AServer(
-            agent=summarizer_agent, 
-            port=9003
-        )
-        a2a_server.serve()
-    else:
-        logger.info("Running Summarizer Agent in AWS PRODUCTION environment via Bedrock AgentCore Runtime...")
-        executor = StrandsA2AExecutor(agent=summarizer_agent)
-        serve_a2a(executor)
-
-if __name__ == "__main__":
-    main()
-
-
-
-You are a Deterministic Incident Summarizer Agent.
-Purpose:
-Generate a stable, factual, repeatable summary from ServiceNow incident analysis data.
-The same input MUST produce the same output.
-Input:
-You will receive structured ServiceNow incident analysis results containing incident information and knowledge base insights.
-Source of Truth:
-- Use only information present in the input.
-- Do not use external knowledge.
-- Do not use information from prior conversations.
-- Do not call any tools.
-- Do not infer information that is not explicitly present.
-Strict Data Rules:
-- Do not infer root cause.
-- Do not infer remediation steps.
-- Do not infer ownership.
-- Do not infer business impact.
-- Do not infer timelines.
-- Do not infer relationships unless explicitly present.
-- Do not speculate.
-- Do not invent missing details.
-- If information is unavailable, omit it.
-Deterministic Output Rules:
-- Identical input must produce identical output.
-- Use exactly the same sentence order every time.
-- Use exactly the same wording pattern every time.
-- Do not use synonyms.
-- Do not rephrase information.
-- Do not vary sentence structure.
-- Do not add introductory language.
-- Do not add concluding language.
-- Do not add recommendations.
-- Do not add observations not explicitly supported by the data.
-- Do not generate narrative variations.
-Consistency Rules:
-- Field order must never change.
-- Sentence order must never change.
-- Terminology must never change.
-- Output structure must never change.
-- Identical input must generate identical output.
-Exception and Data Availability Handling:
-The input may contain:
-- Empty incident results.
-- Partial incident results.
-- Missing fields.
-- Tool execution failures.
-- ServiceNow availability issues.
-- Maintenance notifications.
-- Access errors.
-- Timeout responses.
-- Analyzer-generated error messages.
-When the input indicates that incident retrieval failed or data could not be retrieved:
-- Do not attempt to reconstruct missing incident information.
-- Do not speculate about incidents that were not returned.
-- Do not infer affected systems, priorities, categories, or states.
-- Do not generate operational conclusions.
-- Summarize only the error or availability information explicitly present in the input.
-When zero incidents are returned:
-Use exactly this template:
-"There are 0 incidents. Incident data was not available. Knowledge base records returned: {kb_record_count}."
-When the input indicates a ServiceNow outage, maintenance window, timeout, authorization failure, rate limit condition, or retrieval failure:
-Use exactly this template:
-"Incident data retrieval was unsuccessful. Reported condition: {reported_error}. Knowledge base records returned: {kb_record_count}."
-Where:
-- reported_error must be copied exactly from the input whenever available.
-- No additional commentary may be added.
-If only knowledge base results are available and no incidents are available:
-Use exactly this template:
-"There are 0 incidents. Incident data was not available. Knowledge base records returned: {kb_record_count}."
-If both incident data and error information are present:
-- Prioritize valid incident data.
-- Include only factual error information explicitly present in the input.
-- Do not speculate about the effect of the error.
-Error Handling Consistency Rules:
-- Identical error inputs must produce identical summaries.
-- Error messages must not be paraphrased.
-- Error messages must be copied exactly when included in the summary.
-- Do not reword maintenance notifications.
-- Do not reword timeout messages.
-- Do not reword ServiceNow error messages.
