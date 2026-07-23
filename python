@@ -1,87 +1,70 @@
-/home/vuniyal/git/analyzeragent_agent/app/agent/.venv/lib/python3.12/site-packages/a2a/server/request_handlers/default_request_handler.py:196: UserWarning: The default A2A response stream implemented in the strands sdk does not conform to what is expected in the A2A spec. Please set the `enable_a2a_compliant_streaming` boolean to `True` on your `A2AServer` class to properly conform to the spec. In the next major version release, this will be the default behavior.
-  await self.agent_executor.execute(request, queue)
-INFO:strands.telemetry.metrics:Creating Strands MetricsClient
+def start_metrics_logger(agent, agent_name: str):
 
-Tool #1: search_incidents
-INFO:mcp_client.client:TOOL EXECUTED: search_incidents
-INFO:mcp_client.client:FINAL TOOL ARGS SENT TO MCP: {
-  "short_description": "Intermittent network reachability outages caused all services to be down on MW001, MW002"
-}
-INFO:mcp_client.client:MCP METHOD CALLED: tools/call
-INFO:mcp_client.client:Trace context injected into MCP call: {}
-INFO:mcp_client.client:FINAL MCP PAYLOAD PARAMS: {
-  "name": "search_incidents",
-  "arguments": {
-    "short_description": "Intermittent network reachability outages caused all services to be down on MW001, MW002",
-    "trace_context": {}
-  }
-}
+    def _worker():
+        # Track the unique ID of the invocation to avoid double-printing
+        last_logged_invocation_id = None
+        last_token_count = 0
+        stable_count = 0
 
-Tool #2: search_incidents
-INFO:mcp_client.client:TOOL EXECUTED: search_incidents
-INFO:mcp_client.client:FINAL TOOL ARGS SENT TO MCP: {
-  "query": "short_descriptionLIKEIntermittent network reachability outages caused all services to be down on MW001, MW002"
-}
-INFO:mcp_client.client:MCP METHOD CALLED: tools/call
-INFO:mcp_client.client:Trace context injected into MCP call: {}
-INFO:mcp_client.client:FINAL MCP PAYLOAD PARAMS: {
-  "name": "search_incidents",
-  "arguments": {
-    "query": "short_descriptionLIKEIntermittent network reachability outages caused all services to be down on MW001, MW002",
-    "trace_context": {}
-  }
-}
-INFO:__main__:
-┌──────────────────────────────────────────────────┐
-│ 📊 ANALYZER REQUEST METRICS SUMMARY 
-├──────────────────────────────────────────────────┤
-│ 🔄 Tool Cycles   : 2
-│ 📥 Input Tokens  : 8
-│ 📤 Output Tokens : 168
-│ 💾 Cache Write   : 2893
-│ ⚡ Cache Read    : 2696 (SAVED!)
-├──────────────────────────────────────────────────┤
-│ 💰 BILLED TOKENS : -2520
-└──────────────────────────────────────────────────┘
+        while True:
+            time.sleep(2)
+            try:
+                latest = agent.event_loop_metrics.latest_agent_invocation
+                
+                if not latest or not latest.cycles:
+                    continue
 
+                # Use the ID of the first cycle to identify the overall request
+                invocation_id = latest.cycles[0].event_loop_cycle_id
+                
+                usage = latest.usage
+                total_tokens = usage.get("totalTokens", 0)
 
-Tool #3: knowledge_base_search
-INFO:__main__:Executing knowledge_base_search tool. Query: 'Intermittent network reachability outages caused all services to be down on MW001, MW002'
-INFO:__main__:[KB_CONTENT_COUNT] 1
+                # Skip empty/initializing requests
+                if total_tokens == 0:
+                    continue
 
-Tool #4: IncidentAnalysis
-INFO:     127.0.0.1:52034 - "POST / HTTP/1.1" 200 OK
+                # Skip if we already printed the dashboard for this specific request
+                if invocation_id == last_logged_invocation_id:
+                    continue
 
-Tool #5: search_incidents
-INFO:mcp_client.client:TOOL EXECUTED: search_incidents
-INFO:mcp_client.client:FINAL TOOL ARGS SENT TO MCP: {
-  "query": "short_descriptionLIKEIntermittent network reachability outages caused all services to be down on MW001, MW002"
-}
-INFO:mcp_client.client:MCP METHOD CALLED: tools/call
-INFO:mcp_client.client:Trace context injected into MCP call: {}
-INFO:mcp_client.client:FINAL MCP PAYLOAD PARAMS: {
-  "name": "search_incidents",
-  "arguments": {
-    "query": "short_descriptionLIKEIntermittent network reachability outages caused all services to be down on MW001, MW002",
-    "trace_context": {}
-  }
-}
-INFO:__main__:
-┌──────────────────────────────────────────────────┐
-│ 📊 ANALYZER REQUEST METRICS SUMMARY 
-├──────────────────────────────────────────────────┤
-│ 🔄 Tool Cycles   : 1
-│ 📥 Input Tokens  : 3
-│ 📤 Output Tokens : 87
-│ 💾 Cache Write   : 0
-│ ⚡ Cache Read    : 2696 (SAVED!)
-├──────────────────────────────────────────────────┤
-│ 💰 BILLED TOKENS : -2606
-└──────────────────────────────────────────────────┘
+                # DEBOUNCE LOGIC: Wait for token count to stop moving
+                if total_tokens == last_token_count:
+                    stable_count += 1
+                else:
+                    last_token_count = total_tokens
+                    stable_count = 0
 
+                # If tokens haven't changed for 10 seconds (5 loops of 2s), the request is truly finished!
+                if stable_count >= 5:
+                    input_t = usage.get("inputTokens", 0)
+                    output_t = usage.get("outputTokens", 0)
+                    cache_r = usage.get("cacheReadInputTokens", 0)
+                    cache_w = usage.get("cacheWriteInputTokens", 0)
+                    
+                    # Create a clean, exact representation of AWS billing buckets
+                    dashboard = (
+                        f"\n"
+                        f"┌──────────────────────────────────────────────────┐\n"
+                        f"│ 📊 {agent_name} REQUEST METRICS SUMMARY \n"
+                        f"├──────────────────────────────────────────────────┤\n"
+                        f"│ 🔄 Agent Cycles    : {len(latest.cycles)}\n"
+                        f"│ 📥 Standard Input  : {input_t} tokens\n"
+                        f"│ 📤 Output Generated: {output_t} tokens\n"
+                        f"│ 💾 Cache Written   : {cache_w} tokens\n"
+                        f"│ ⚡ Cache Read      : {cache_r} tokens (Discounted!)\n"
+                        f"├──────────────────────────────────────────────────┤\n"
+                        f"│ 📈 Total Processed : {total_tokens} tokens\n"
+                        f"└──────────────────────────────────────────────────┘\n"
+                    )
+                    
+                    logger.info(dashboard)
+                    
+                    # Lock it in so we don't print again until a new request starts
+                    last_logged_invocation_id = invocation_id
+                    stable_count = 0
 
-Tool #6: knowledge_base_search
-INFO:__main__:Executing knowledge_base_search tool. Query: 'Intermittent network reachability outages caused all services to be down on MW001, MW002'
-INFO:__main__:[KB_CONTENT_COUNT] 1
+            except Exception:
+                logger.exception("[%s] Failed to collect metrics", agent_name)
 
-Tool #7: IncidentAnalysis
+    threading.Thread(target=_worker, daemon=True).start()
