@@ -1,3 +1,4 @@
+https://strandsagents.com/docs/api/python/strands.multiagent.a2a.server/
 vuniyal@LIN-DK4CBV3:~/git/summarizeragent_agent/app/agent$ uv run python -m main
 INFO:botocore.credentials:Found credentials in shared credentials file: ~/.aws/credentials
 INFO:__main__:Attempting to fetch configuration from Bedrock (ID: arn:aws:bedrock:us-east-1:224198986708:prompt/FK0MKCLEEV, Version: DRAFT) - Try 1
