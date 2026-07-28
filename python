@@ -1,57 +1,55 @@
-from collections import namedtuple
-from strands.models.bedrock import BedrockModel
-from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
+from mangum import Mangum
+import psycopg2
 import os
+from decimal import Decimal
 
-load_dotenv()
+app = FastAPI()
 
-AWS_GUARDRAIL_IDENTIFIER = os.getenv("AWS_GUARDRAIL_IDENTIFIER","")
-
-def load_model() -> BedrockModel:
-
-    StrandsCacheConfig = namedtuple(
-        "CacheConfig",
-        ["strategy", "ttl"]
+# Establish connection outside the handler for container reuse
+def get_db_connection():
+    return psycopg2.connect(
+        host='database-1.cohce00kypwz.us-east-1.rds.amazonaws.com',
+        port=5432,
+        database='postgres',
+        user='postgres',
+        password=os.environ.get("DB_PASSWORD", "WXgNftiYTT=5z^Ddj,U-Ust2uBH,8t"), # Replaced with env var best practice
+        sslmode='require'
     )
 
-    return BedrockModel(
-        model_id="global.anthropic.claude-sonnet-4-5-20250929-v1:0",
-        guardrail_id=AWS_GUARDRAIL_IDENTIFIER,
-        guardrail_version="1",
-        guardrail_trace="enabled",
-        #cache_prompt="default",
-        cache_tools="default"        
-        #cache_config=StrandsCacheConfig(
-        #    strategy="auto",
-        #    ttl=None
-        #)
-    )
+@app.get("/config/{agent_name}")
+def get_agent_config(agent_name: str):
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        # Querying the table you created
+        query = """
+            SELECT model_id, temperature, top_p, max_tokens 
+            FROM agent_config 
+            WHERE agent_name = %s AND active = TRUE
+        """
+        cur.execute(query, (agent_name,))
+        result = cur.fetchone()
+        
+        if not result:
+            raise HTTPException(status_code=404, detail=f"Agent '{agent_name}' not found")
+            
+        return {
+            "agent_name": agent_name,
+            "model_id": result[0],
+            # Cast Decimals to float to prevent JSON serialization errors
+            "temperature": float(result[1]) if isinstance(result[1], Decimal) else result[1],
+            "top_p": float(result[2]) if isinstance(result[2], Decimal) else result[2],
+            "max_tokens": result[3]
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if conn:
+            conn.close()
 
-CREATE TABLE agent_config (
-    id SERIAL PRIMARY KEY,
-    agent_name VARCHAR(100) UNIQUE NOT NULL,
-    model_id VARCHAR(255) NOT NULL,
-    temperature DECIMAL(3,2),
-    top_p DECIMAL(3,2),
-    max_tokens INTEGER,
-    active BOOLEAN DEFAULT TRUE,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
-INSERT INTO agent_config (
-    agent_name,
-    model_id,
-    temperature,
-    top_p,
-    max_tokens
-)
-VALUES (
-    'agent1',
-    'global.anthropic.claude-sonnet-4-5-20250929-v1:0',
-    0.20,
-    0.95,
-    4000
-);
-
-SELECT * FROM agent_config;
+# Mangum acts as the bridge between AWS Lambda and FastAPI
+handler = Mangum(app)
