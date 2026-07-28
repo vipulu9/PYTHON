@@ -26,3 +26,32 @@ def load_model() -> BedrockModel:
         #    ttl=None
         #)
     )
+
+CREATE TABLE agent_config (
+    id SERIAL PRIMARY KEY,
+    agent_name VARCHAR(100) UNIQUE NOT NULL,
+    model_id VARCHAR(255) NOT NULL,
+    temperature DECIMAL(3,2),
+    top_p DECIMAL(3,2),
+    max_tokens INTEGER,
+    active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+INSERT INTO agent_config (
+    agent_name,
+    model_id,
+    temperature,
+    top_p,
+    max_tokens
+)
+VALUES (
+    'agent1',
+    'global.anthropic.claude-sonnet-4-5-20250929-v1:0',
+    0.20,
+    0.95,
+    4000
+);
+
+SELECT * FROM agent_config;
