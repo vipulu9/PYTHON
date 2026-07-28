@@ -1,223 +1,62 @@
-import os
-import logging
-import time
-import boto3
-from dotenv import load_dotenv
-from strands import Agent
-from strands.tools import tool
-from strands.multiagent.a2a.executor import StrandsA2AExecutor
-from strands.multiagent.a2a import A2AServer
-from bedrock_agentcore.runtime import serve_a2a
-from model.load import load_model
-from strands.hooks import AfterInvocationEvent
-from pydantic import BaseModel, Field
-from typing import List, Optional
+import json
+import psycopg2
 
-load_dotenv()
-AWS_REGION = os.getenv("AWS_REGION", "")
+def lambda_handler(event, context):
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-logging.getLogger("strands.telemetry.metrics").setLevel(logging.INFO)
+    password = "WXgNftiYTT=5z^Ddj,U-Ust2uBH,8t"
 
-# Initialize AWS Session early to allow SSM parameter loading
-aws_session = boto3.Session(region_name=AWS_REGION)
-ssm_client = aws_session.client('ssm')
+    conn = None
 
-def get_ssm_parameter(param_path: str, fallback_env: str) -> str:
-    """Fetches a configuration value from AWS SSM Parameter Store with an env fallback."""
     try:
-        response = ssm_client.get_parameter(Name=param_path, WithDecryption=False)
-        return response['Parameter']['Value']
+        conn = psycopg2.connect(
+            host='database-1.cohce00kypwz.us-east-1.rds.amazonaws.com',
+            port=5432,
+            database='postgres',
+            user='postgres',
+            password=password,
+            sslmode='verify-full',
+            sslrootcert='/var/task/global-bundle.pem'  # Lambda deployment package path
+        )
+
+        cur = conn.cursor()
+
+        cur.execute('SELECT version();')
+        db_version = cur.fetchone()[0]
+
+        cur.close()
+
+        return {
+            'statusCode': 200,
+            'body': json.dumps({
+                'message': 'Database connection successful',
+                'version': db_version
+            })
+        }
+
     except Exception as e:
-        logger.error(f"SSM path {param_path} not found or inaccessible ({e}). Falling back to environment variable.")
-        return os.getenv(fallback_env, "")
+        print(f"Database error: {e}")
 
-AWS_PROMPT_ID = get_ssm_parameter("/config/summarizer_agent/prompt_id", "AWS_PROMPT_ID")
-AWS_PROMPT_VERSION = get_ssm_parameter("/config/summarizer_agent/prompt_version", "AWS_PROMPT_VERSION")
+        return {
+            'statusCode': 500,
+            'body': json.dumps({
+                'error': str(e)
+            })
+        }
 
-# Define the dummy tool to anchor the Anthropic cache marker
-@tool
-def cache_anchor_tool() -> str:
-    """A structural anchor to hold the Anthropic cache wall in place. Do not call this."""
-    return "ok"
-
-bedrock_agent_client = aws_session.client('bedrock-agent')
-
-#fetching system prompt
-def get_bedrock_system_prompt(prompt_id: str, prompt_version: str, **variables) -> str:
-    """
-    Fetches the system prompt and inference configurations from AWS Bedrock using a retry mechanism.
-    Injects dynamic variables into the prompt text.
-    """
-    if not prompt_id:
-        logger.warning("AWS_PROMPT_ID is not set. Returning empty configuration.")
-        return ""
-
-    max_retries = 3
-    for attempt in range(1, max_retries + 1):
-        try:
-            logger.info(f"Attempting to fetch configuration from Bedrock (ID: {prompt_id}, Version: {prompt_version}) - Try {attempt}")
-            
-            response = bedrock_agent_client.get_prompt(
-                promptIdentifier=prompt_id,
-                promptVersion=prompt_version
-            )
-            
-            variants = response.get("variants", [])
-            if not variants:
-                logger.error(f"No variants found for prompt {prompt_id}.")
-                return ""
-                
-            template_config = variants[0].get("templateConfiguration", {})
-            prompt_text = template_config.get("text", {}).get("text", "")
-
-            if not prompt_text:
-                logger.error(f"Prompt text is empty in the response.")
-                return ""
-
-            # Inject dynamic variables
-            for key, value in variables.items():
-                prompt_text = prompt_text.replace(f"{{{{{key}}}}}", str(value))
-
-            logger.info(f"Successfully fetched prompt from Bedrock prompt management: {prompt_text}")
-            return prompt_text
-
-        except Exception as e:
-            if attempt < max_retries:
-                logger.warning(f"Attempt {attempt} failed due to error: {e}. Retrying in 2 seconds...")
-                time.sleep(2)
-            else:
-                logger.error(f"Failed to fetch configuration from Bedrock after {max_retries} attempts due to error: {e}.")
-                return ""
-
-# Define dynamic variables based on environment and constants
-dynamic_prompt_variables = {}
-
-# Fetch the combined configuration dictionary
-SYSTEM_PROMPT = get_bedrock_system_prompt(
-    prompt_id=AWS_PROMPT_ID,
-    prompt_version=AWS_PROMPT_VERSION,
-    **dynamic_prompt_variables
-)
-
-class IncidentSummary(BaseModel):
-    incident_count: int = Field(
-        default=0,
-        description="Total number of incidents"
-    )
-
-    affected_systems: Optional[str] = Field(
-        default=None,
-        description="Alphabetically sorted affected systems"
-    )
-
-    categories: Optional[str] = Field(
-        default=None,
-        description="Alphabetically sorted categories"
-    )
-
-    priorities: Optional[str] = Field(
-        default=None,
-        description="Sorted priorities"
-    )
-
-    states: Optional[str] = Field(
-        default=None,
-        description="Sorted states"
-    )
-
-    short_description: Optional[str] = Field(
-        default=None,
-        description="Short description copied from first incident"
-    )
-
-    knowledge_base_record_count: int = Field(
-        default=0,
-        description="Number of KB records"
-    )
-
-    summary_text: str = Field(
-        description="Final deterministic summary"
-    )
-
-# ========================================================
-# LOGGING METRICS (Strictly Per-Request)
-# ========================================================
-def log_metrics_on_complete(event: AfterInvocationEvent) -> None:
-    """Triggered automatically by Strands strictly for the current HTTP request."""
-    
-    if not event.result or not event.result.metrics:
-        return
-
-    # Extract metrics ONLY for the single, latest request invocation
-    if event.result.metrics.agent_invocations:
-        latest_invocation = event.result.metrics.agent_invocations[-1]
-        metrics = latest_invocation.usage
-        cycle_count = len(latest_invocation.cycles)
-    else:
-        metrics = event.result.metrics.accumulated_usage
-        cycle_count = 1
-
-    input_t = metrics.get('inputTokens', 0)
-    output_t = metrics.get('outputTokens', 0)
-    cache_w = metrics.get('cacheWriteInputTokens', 0)
-    cache_r = metrics.get('cacheReadInputTokens', 0)
-    total_tokens = metrics.get('totalTokens', 0)
-
-    # Calculate actual billed tokens
-    billed_tokens = (input_t + output_t) - cache_r
-
-    dashboard = (
-        f"\n"
-        f"┌──────────────────────────────────────────────────┐\n"
-        f"│ 📊 ANALYZER SINGLE-REQUEST METRICS               │\n"
-        f"├──────────────────────────────────────────────────┤\n"
-        f"│ 🔄 Agent Cycles    : {cycle_count}\n"
-        f"│ 📥 Standard Input  : {input_t} tokens\n"
-        f"│ 📤 Output Generated: {output_t} tokens\n"
-        f"│ 💾 Cache Written   : {cache_w} tokens\n"
-        f"│ ⚡ Cache Read      : {cache_r} tokens (Discounted!)\n"
-        f"├──────────────────────────────────────────────────┤\n"
-        f"│ 📈 Total Processed : {total_tokens} tokens\n"
-        f"└──────────────────────────────────────────────────┘\n"
-    )
-    
-    logger.info(dashboard)
+    finally:
+        if conn:
+            conn.close()
 
 
-# Factory function to create an isolated, dedicated agent per A2A context
-def create_summarizer_agent(context_id: str) -> Agent:
-    summarizer_agent = Agent(
-        name="Summarizer Agent",    
-        description="Provides an immediate specialist summary on incident data.", 
-        model=load_model(),
-        system_prompt=SYSTEM_PROMPT,
-        tools=[cache_anchor_tool],
-        structured_output_model=IncidentSummary,
-    )
-    summarizer_agent.add_hook(log_metrics_on_complete, AfterInvocationEvent)
-    return summarizer_agent
+[WARNING]	2026-07-28T12:04:22.814Z		LAMBDA_WARNING: Unhandled exception. The most likely cause is an issue in the function code. However, in rare cases, a Lambda runtime update can cause unexpected function behavior. For functions using managed runtimes, runtime updates can be triggered by a function change, or can be applied automatically. To determine if the runtime has been updated, check the runtime version in the INIT_START log entry. If this error correlates with a change in the runtime version, you may be able to mitigate this error by temporarily rolling back to the previous runtime version. For more information, see https://docs.aws.amazon.com/lambda/latest/dg/runtimes-update.html
 
-def main():
-    # Reads environment variable dynamically. Evaluates to True if set to 'local' (case-insensitive)
-    is_local = os.getenv("ENV", "prod").lower() == "local"
-    
-    if is_local:
-        logger.info("Running Summarizer Agent in LOCAL mode on port 9003...")
-        a2a_server = A2AServer(
-            agent_factory=create_summarizer_agent, 
-            port=9003,
-            enable_a2a_compliant_streaming=True
-        )
-        a2a_server.serve()
-    else:
-        logger.info("Running Summarizer Agent in AWS PRODUCTION environment via Bedrock AgentCore Runtime...")
-        executor = StrandsA2AExecutor(
-            agent_factory=create_summarizer_agent,
-            enable_a2a_compliant_streaming=True
-        )
-        serve_a2a(executor)
+[WARNING] 2026-07-28T12:04:22.814Z LAMBDA_WARNING: Unhandled exception. The most likely cause is an issue in the function code. However, in rare cases, a Lambda runtime update can cause unexpected function behavior. For functions using managed runtimes, runtime updates can be triggered by a function change, or can be applied automatically. To determine if the runtime has been updated, check the runtime version in the INIT_START log entry. If this error correlates with a change in the runtime version, you may be able to mitigate this error by temporarily rolling back to the previous runtime version. For more information, see https://docs.aws.amazon.com/lambda/latest/dg/runtimes-update.html
+2026-07-28T17:34:22.814+05:30
+[ERROR] Runtime.ImportModuleError: Unable to import module 'lambda_function': No module named 'psycopg2._psycopg'
+Traceback (most recent call last):
 
-if __name__ == "__main__":
-    main()
+[ERROR] Runtime.ImportModuleError: Unable to import module 'lambda_function': No module named 'psycopg2._psycopg' Traceback (most recent call last):
+2026-07-28T17:34:22.870+05:30
+INIT_REPORT Init Duration: 166.16 ms	Phase: init	Status: error	Error Type: Runtime.ImportModuleError
+
+INIT_REPORT Init Duration: 166.16 ms Phase: init Status: error Error Type: Runtime.ImportModuleError
