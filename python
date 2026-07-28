@@ -1,62 +1,28 @@
-import json
-import psycopg2
+from collections import namedtuple
+from strands.models.bedrock import BedrockModel
+from dotenv import load_dotenv
+import os
 
-def lambda_handler(event, context):
+load_dotenv()
 
-    password = "WXgNftiYTT=5z^Ddj,U-Ust2uBH,8t"
+AWS_GUARDRAIL_IDENTIFIER = os.getenv("AWS_GUARDRAIL_IDENTIFIER","")
 
-    conn = None
+def load_model() -> BedrockModel:
 
-    try:
-        conn = psycopg2.connect(
-            host='database-1.cohce00kypwz.us-east-1.rds.amazonaws.com',
-            port=5432,
-            database='postgres',
-            user='postgres',
-            password=password,
-            sslmode='verify-full',
-            sslrootcert='/var/task/global-bundle.pem'  # Lambda deployment package path
-        )
+    StrandsCacheConfig = namedtuple(
+        "CacheConfig",
+        ["strategy", "ttl"]
+    )
 
-        cur = conn.cursor()
-
-        cur.execute('SELECT version();')
-        db_version = cur.fetchone()[0]
-
-        cur.close()
-
-        return {
-            'statusCode': 200,
-            'body': json.dumps({
-                'message': 'Database connection successful',
-                'version': db_version
-            })
-        }
-
-    except Exception as e:
-        print(f"Database error: {e}")
-
-        return {
-            'statusCode': 500,
-            'body': json.dumps({
-                'error': str(e)
-            })
-        }
-
-    finally:
-        if conn:
-            conn.close()
-
-
-[WARNING]	2026-07-28T12:04:22.814Z		LAMBDA_WARNING: Unhandled exception. The most likely cause is an issue in the function code. However, in rare cases, a Lambda runtime update can cause unexpected function behavior. For functions using managed runtimes, runtime updates can be triggered by a function change, or can be applied automatically. To determine if the runtime has been updated, check the runtime version in the INIT_START log entry. If this error correlates with a change in the runtime version, you may be able to mitigate this error by temporarily rolling back to the previous runtime version. For more information, see https://docs.aws.amazon.com/lambda/latest/dg/runtimes-update.html
-
-[WARNING] 2026-07-28T12:04:22.814Z LAMBDA_WARNING: Unhandled exception. The most likely cause is an issue in the function code. However, in rare cases, a Lambda runtime update can cause unexpected function behavior. For functions using managed runtimes, runtime updates can be triggered by a function change, or can be applied automatically. To determine if the runtime has been updated, check the runtime version in the INIT_START log entry. If this error correlates with a change in the runtime version, you may be able to mitigate this error by temporarily rolling back to the previous runtime version. For more information, see https://docs.aws.amazon.com/lambda/latest/dg/runtimes-update.html
-2026-07-28T17:34:22.814+05:30
-[ERROR] Runtime.ImportModuleError: Unable to import module 'lambda_function': No module named 'psycopg2._psycopg'
-Traceback (most recent call last):
-
-[ERROR] Runtime.ImportModuleError: Unable to import module 'lambda_function': No module named 'psycopg2._psycopg' Traceback (most recent call last):
-2026-07-28T17:34:22.870+05:30
-INIT_REPORT Init Duration: 166.16 ms	Phase: init	Status: error	Error Type: Runtime.ImportModuleError
-
-INIT_REPORT Init Duration: 166.16 ms Phase: init Status: error Error Type: Runtime.ImportModuleError
+    return BedrockModel(
+        model_id="global.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        guardrail_id=AWS_GUARDRAIL_IDENTIFIER,
+        guardrail_version="1",
+        guardrail_trace="enabled",
+        #cache_prompt="default",
+        cache_tools="default"        
+        #cache_config=StrandsCacheConfig(
+        #    strategy="auto",
+        #    ttl=None
+        #)
+    )
