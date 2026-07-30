@@ -1,104 +1,43 @@
-def get_bedrock_system_prompt(prompt_id: str, prompt_version: str, **variables) -> dict:
-    """
-    Fetches strictly the prompt text and cache points from AWS Bedrock, 
-    ignoring inference parameters like temperature or top_k.
-    """
-    config_result = {
-        "text": "",
-        "has_system_cache": False,
-        "has_tool_cache": False
+from dotenv import load_dotenv
+import os
+import requests
+from strands.models.bedrock import BedrockModel, CacheToolsConfig
+
+load_dotenv()
+
+AWS_GUARDRAIL_IDENTIFIER = os.getenv("AWS_GUARDRAIL_IDENTIFIER","")
+CONFIG_API_URL = os.getenv("CONFIG_API_URL", "https://y2mccfntu2.execute-api.us-east-1.amazonaws.com/default/db_testing") 
+
+def load_model(agent_name: str = "agent1", enable_tool_cache: bool = False) -> BedrockModel:
+    
+    try:
+        response = requests.get(CONFIG_API_URL, params={"agent_name": agent_name})
+        response.raise_for_status() 
+        db_config = response.json()
+        print(f"Successfully loaded config for {agent_name} from Aurora DB.")
+    
+    except requests.exceptions.RequestException as e:
+        print(f"Failed to fetch config from DB: {e}. Falling back to defaults.")
+        db_config = {
+            "model_id": "global.anthropic.claude-sonnet-4-5-20250929-v1:0",
+            "temperature": 0.20,
+            "top_p": 0.95
+        }
+        
+    # Build base model configuration
+    model_kwargs = {
+        "model_id": db_config["model_id"],
+        "guardrail_id": AWS_GUARDRAIL_IDENTIFIER,
+        "guardrail_version": "1",
+        "guardrail_trace": "enabled"
     }
     
-    if not prompt_id:
-        logger.warning("AWS_PROMPT_ID is not set. Returning empty configuration.")
-        return config_result
-
-    max_retries = 3
-    for attempt in range(1, max_retries + 1):
-        try:
-            logger.info(f"Attempting to fetch prompt from Bedrock (ID: {prompt_id}, Version: {prompt_version}) - Try {attempt}")
-            
-            response = bedrock_agent_client.get_prompt(
-                promptIdentifier=prompt_id,
-                promptVersion=prompt_version
-            )
-            
-            # Navigate directly to the text/chat templates, ignoring model/inference configs
-            prompt_data = response.get("variants", [])[0].get("templateConfiguration", {})
-            
-            if "text" in prompt_data:
-                config_result["text"] = prompt_data["text"].get("text", "")
-                config_result["has_system_cache"] = "cachePoint" in prompt_data["text"]
-                
-            elif "chat" in prompt_data:
-                sys_prompts = prompt_data["chat"].get("system", [])
-                if sys_prompts:
-                    config_result["text"] = sys_prompts[0].get("text", "")
-                    config_result["has_system_cache"] = "cachePoint" in sys_prompts[0]
-                
-                tools = prompt_data["chat"].get("toolConfiguration", {}).get("tools", [])
-                config_result["has_tool_cache"] = any("cachePoint" in t for t in tools)
-
-            # Inject dynamic variables
-            for key, value in variables.items():
-                config_result["text"] = config_result["text"].replace(f"{{{{{key}}}}}", str(value))
-
-            logger.info("Successfully extracted prompt text and cache flags from Bedrock.")
-            return config_result
-
-        except Exception as e:
-            if attempt < max_retries:
-                time.sleep(2)
-            else:
-                logger.error(f"Failed to fetch prompt from Bedrock after {max_retries} attempts: {e}.")
-                return config_result
-
-# Fetch the combined configuration dictionary
-PROMPT_DATA = get_bedrock_system_prompt(
-    prompt_id=AWS_PROMPT_ID,
-    prompt_version=AWS_PROMPT_VERSION,
-    **dynamic_prompt_variables
-)
-
-# ... (Keep IncidentSummary and log_metrics_on_complete exactly as they were) ...
-
-def main():
-    is_local = os.getenv("ENV", "prod").lower() == "local"
-    
-    # 1. Dynamically build the system prompt blocks based ONLY on Bedrock flags
-    system_blocks = [SystemContentBlock(text=PROMPT_DATA["text"])]
-    if PROMPT_DATA["has_system_cache"]:
-        system_blocks.append(SystemContentBlock(cachePoint={"type": "default"}))
-        logger.info("System cache point dynamically applied.")
-    
-    # 2. Pass the tool cache flag to your model loader
-    MODEL_ID_DB = load_model(
-        agent_name="Summarizer Agent", 
-        enable_tool_cache=PROMPT_DATA["has_tool_cache"]
-    )
-    
-    summarizer_agent = Agent(
-        name="Summarizer Agent",    
-        description="Provides an immediate specialist summary on incident data.", 
-        model=MODEL_ID_DB,
-        system_prompt=system_blocks,
-        tools=tools,
-        structured_output_model=IncidentSummary,
-    )
-
-    summarizer_agent.add_hook(log_metrics_on_complete, AfterInvocationEvent)
-
-    if is_local:
-        logger.info("Running Summarizer Agent in LOCAL mode on port 9003...")
-        a2a_server = A2AServer(
-            agent=summarizer_agent, 
-            port=9003
+    # Dynamically inject tool caching if enabled via Bedrock Prompt Management
+    if enable_tool_cache:
+        model_kwargs["cache_tools"] = CacheToolsConfig(
+            type="default",
+            ttl="1h"
         )
-        a2a_server.serve()
-    else:
-        logger.info("Running Summarizer Agent in AWS PRODUCTION environment...")
-        executor = StrandsA2AExecutor(agent=summarizer_agent)
-        serve_a2a(executor)
-
-if __name__ == "__main__":
-    main()
+        print("Tool caching dynamically enabled from Bedrock Prompt config.")
+        
+    return BedrockModel(**model_kwargs)
