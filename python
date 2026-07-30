@@ -12,24 +12,64 @@ def deploy_or_update_prompt():
     """
     Checks if a specific prompt exists in AWS Bedrock.
     Updates it if found, creates it if not, and publishes a locked version.
+    Supports dynamic injection of prompt caching checkpoints via the CACHE_MODE env var.
     """
     client = boto3.client('bedrock-agent', region_name='us-east-1')
-    prompt_name = os.getenv("PROMPT_NAME","")
-    system_text = os.getenv("SYSTEM_TEXT","")
+    
+    prompt_name = os.getenv("PROMPT_NAME", "")
+    system_text = os.getenv("SYSTEM_TEXT", "")
+    cache_mode = os.getenv("CACHE_MODE", "none").lower() # "none", "tools", or "tools_system"
 
-    # Define the core variant payload (reusable for both Create and Update)
+    # ==========================================
+    # CONSTRUCT CACHE-AWARE CHAT PAYLOAD
+    # ==========================================
+    
+    # 1. Start with the base system instruction
+    system_block = [{"text": system_text}]
+    
+    # 2. Add system cache point if requested
+    if cache_mode == "tools_system":
+        system_block.append({"cachePoint": {"type": "default"}})
+
+    # 3. Define the dummy anchor tool (required to attach tool cache)
+    dummy_tool = {
+        "toolSpec": {
+            "name": "cache_anchor_tool",
+            "description": "A structural anchor to hold Anthropic cache wall inplace. Do not call this",
+            "inputSchema": {
+                "json": {
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }
+            }
+        }
+    }
+    
+    # 4. Build the tool configuration list
+    tool_list = [dummy_tool]
+    
+    # 5. Add the tool cache point if tools OR system caching is requested
+    if cache_mode in ["tools", "tools_system"]:
+        tool_list.append({"cachePoint": {"type": "default"}})
+
+    # 6. Construct the final dynamic variant payload
     prompt_variant = {
         "name": "PrimaryVariant",
-        "templateType": "TEXT",
+        "templateType": "CHAT",
         "templateConfiguration": {
-            "text": {
-                "text": system_text
+            "chat": {
+                "system": system_block,
+                "toolConfiguration": {
+                    "tools": tool_list
+                },
+                "messages": [] 
             }
         },
         "modelId": "anthropic.claude-3-sonnet-20240229-v1:0",
         "inferenceConfiguration": {
             "text": {
-                "temperature": 0.0,  # Locked down for strict routing
+                "temperature": 0.0,
                 "topP": 1.0,
                 "maxTokens": 2000,
                 "stopSequences": []
@@ -44,7 +84,6 @@ def deploy_or_update_prompt():
         logger.info(f"Checking if prompt '{prompt_name}' already exists in AWS...")
         existing_prompt_id = None
 
-        # We use a paginator in case you have hundreds of prompts in your account
         paginator = client.get_paginator('list_prompts')
         for page in paginator.paginate():
             for summary in page.get('promptSummaries', []):
@@ -58,7 +97,7 @@ def deploy_or_update_prompt():
         # STEP 2: Execute Update or Create
         # ==========================================
         if existing_prompt_id:
-            logger.info(f"Match found! Updating existing prompt (ID: {existing_prompt_id})...")
+            logger.info(f"Match found! Updating existing prompt (ID: {existing_prompt_id}) with Cache Mode: {cache_mode}...")
             # Update the existing DRAFT
             client.update_prompt(
                 promptIdentifier=existing_prompt_id,
@@ -70,7 +109,7 @@ def deploy_or_update_prompt():
             final_prompt_id = existing_prompt_id
             logger.info("Successfully updated the DRAFT version.")
         else:
-            logger.info(f"No match found. Creating new prompt '{prompt_name}'...")
+            logger.info(f"No match found. Creating new prompt '{prompt_name}' with Cache Mode: {cache_mode}...")
 
             # Create a brand new DRAFT
             create_response = client.create_prompt(
@@ -80,12 +119,7 @@ def deploy_or_update_prompt():
                 variants=[prompt_variant]
             )
 
-            #logger.info("Create Prompt Response:")
-            #logger.info(json.dumps(create_response, indent=2, default=str))
-
-            # CHANGED: Access ID directly from response
             final_prompt_id = create_response['id']
-
             logger.info(f"Successfully created a new prompt. ID: {final_prompt_id}")
 
         # ==========================================
@@ -95,11 +129,8 @@ def deploy_or_update_prompt():
 
         version_response = client.create_prompt_version(
             promptIdentifier=final_prompt_id,
-            description="Automated deployment publish"
+            description=f"Automated deployment publish (Cache: {cache_mode})"
         )
-
-        logger.info("Create Prompt Version Response:")
-        logger.info(json.dumps(version_response, indent=2, default=str))
 
         locked_version = version_response['version']
 
