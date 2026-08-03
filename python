@@ -1,31 +1,37 @@
 import os
-import requests
-import logging
 from dotenv import load_dotenv
+from strands.models.bedrock import BedrockModel, CacheToolsConfig
+
+# Import from your new shared library
+from base_agent import fetch_agent_config
 
 load_dotenv()
-logger = logging.getLogger(__name__)
+AWS_GUARDRAIL_IDENTIFIER = os.getenv("AWS_GUARDRAIL_IDENTIFIER", "")
 
-CONFIG_API_URL = os.getenv("CONFIG_API_URL", "https://y2mccfntu2.execute-api.us-east-1.amazonaws.com/default/db_testing")
-
-def fetch_agent_config(agent_name: str = "agent1") -> dict:
+def load_model(agent_name: str = "agent1", db_config: dict = None) -> BedrockModel:
     """
-    Shared function to fetch agent configurations (model parameters and cache flags) from the DB.
+    Instantiates the BedrockModel using DB values. 
+    If db_config is not provided, it fetches it using the shared base library function.
     """
-    try:
-        response = requests.get(CONFIG_API_URL, params={"agent_name": agent_name})
-        response.raise_for_status() 
-        db_config = response.json()
-        logger.info(f"Successfully fetched DB config for {agent_name}: {db_config}")
-        return db_config
+    if db_config is None:
+        db_config = fetch_agent_config(agent_name)
 
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Failed to fetch config from DB for {agent_name}: {e}. Using default fallback.")
-        return {
-            "model_id": "global.anthropic.claude-sonnet-4-5-20250929-v1:0",
-            "temperature": 0.20,
-            "top_p": 0.95,
-            "top_k": 50,
-            "enable_system_cache": True,
-            "enable_tool_cache": False
-        }
+    model_kwargs = {
+        "model_id": db_config.get("model_id"),
+        "temperature": db_config.get("temperature", 0.20),
+        "top_p": db_config.get("top_p", 0.95),
+        "top_k": db_config.get("top_k", 50),
+        "guardrail_id": AWS_GUARDRAIL_IDENTIFIER,
+        "guardrail_version": "1",
+        "guardrail_trace": "enabled"
+    }
+    
+    # Enable tool caching if specified in DB config
+    if db_config.get("enable_tool_cache"):
+        model_kwargs["cache_tools"] = CacheToolsConfig(
+            type="default",
+            ttl="5m"
+        )
+        print("Tool caching dynamically enabled from config.")
+        
+    return BedrockModel(**model_kwargs)
