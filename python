@@ -1,7 +1,9 @@
 import os
+import json
 import logging
 import time
 import boto3
+import valkey  # Added for Valkey caching
 from dotenv import load_dotenv
 from strands import Agent
 from strands.multiagent.a2a.executor import StrandsA2AExecutor
@@ -22,6 +24,14 @@ AWS_REGION = os.getenv("AWS_REGION", "")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 logging.getLogger("strands.telemetry.metrics").setLevel(logging.INFO)
+
+# ========================================================
+# VALKEY CACHE INITIALIZATION
+# ========================================================
+VALKEY_HOST = os.getenv("VALKEY_HOST", "localhost")
+VALKEY_PORT = int(os.getenv("VALKEY_PORT", 6379))
+# decode_responses=True ensures we get Python strings instead of bytes
+valkey_client = valkey.Valkey(host=VALKEY_HOST, port=VALKEY_PORT, decode_responses=True)
 
 aws_session = boto3.Session(region_name=AWS_REGION)
 ssm_client = aws_session.client('ssm')
@@ -102,6 +112,40 @@ SYSTEM_PROMPT = get_bedrock_system_prompt(
 )
 
 # ========================================================
+# CACHING HELPER FUNCTION
+# ========================================================
+def get_cached_agent_config(agent_name: str, cache_ttl_seconds: int = 300) -> dict:
+    """
+    Attempts to fetch agent config from Valkey cache. 
+    If not found, fetches from DB and caches it.
+    """
+    cache_key = f"agent_config:{agent_name}"
+    
+    # 1. Try fetching from Valkey
+    try:
+        cached_data = valkey_client.get(cache_key)
+        if cached_data:
+            logger.info(f"⚡ [CACHE HIT] Fetched config for '{agent_name}' from Valkey.")
+            return json.loads(cached_data)
+    except Exception as e:
+        logger.warning(f"Valkey cache read error: {e}. Proceeding to DB fetch.")
+
+    # 2. Cache miss or error: Fetch from DB
+    logger.info(f"🐌 [CACHE MISS] Fetching config for '{agent_name}' from Database...")
+    db_config = fetch_agent_config(agent_name=agent_name)
+
+    # 3. Store the result in Valkey for next time
+    try:
+        # setex sets the value and an expiration TTL in one command
+        valkey_client.setex(cache_key, cache_ttl_seconds, json.dumps(db_config))
+        logger.info(f"💾 Saved config for '{agent_name}' to Valkey (TTL: {cache_ttl_seconds}s).")
+    except Exception as e:
+        logger.warning(f"Valkey cache write error: {e}. Configuration was fetched but not cached.")
+
+    return db_config
+
+
+# ========================================================
 # LOGGING METRICS (Strictly Per-Request)
 # ========================================================
 def log_metrics_on_complete(event: AfterInvocationEvent) -> None:
@@ -140,11 +184,12 @@ def log_metrics_on_complete(event: AfterInvocationEvent) -> None:
     )
     logger.info(dashboard)
 
+
 def main():
     is_local = os.getenv("ENV", "prod").lower() == "local"
 
-    # 1. Fetch DB values via Shared Library
-    db_config = fetch_agent_config(agent_name="agent1")
+    # 1. Fetch DB values via Valkey Cache Wrapper (TTL defaults to 300s/5m)
+    db_config = get_cached_agent_config(agent_name="agent1")
     TTL = db_config.get("ttl", "5m")
 
     # 2. Build system blocks and dynamically check caching flag from DB
@@ -184,6 +229,7 @@ def main():
         logger.info("Running Summarizer Agent in AWS PRODUCTION environment via Bedrock AgentCore Runtime...")
         executor = StrandsA2AExecutor(agent=summarizer_agent)
         serve_a2a(executor)
+
 
 if __name__ == "__main__":
     main()
