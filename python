@@ -1,32 +1,28 @@
 import os
 import logging
-import boto3
-from pydantic import BaseModel, Field
-from typing import List, Optional
-from dotenv import load_dotenv
 import time
-
-from mcp_client.client import build_tools_from_mcp
-from strands import Agent, tool
+import boto3
+from dotenv import load_dotenv
+from strands import Agent
 from strands.multiagent.a2a.executor import StrandsA2AExecutor
 from strands.multiagent.a2a import A2AServer
 from bedrock_agentcore.runtime import serve_a2a
-from model.load import load_model
-from strands_tools.retrieve import retrieve as _kb_retrieve_fn
-import json
-import re
 from strands.hooks import AfterInvocationEvent
+from strands.tools import tool
 from strands.types.content import SystemContentBlock
 
-# Load variables from local .env file
+# IMPORTS FROM SHARED BASE AND LOAD MODULES
+#from base_agent import fetch_agent_config
+from model.load import load_model
+from model.load import fetch_agent_config
+
 load_dotenv()
-AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+AWS_REGION = os.getenv("AWS_REGION", "")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 logging.getLogger("strands.telemetry.metrics").setLevel(logging.INFO)
 
-# Initialize AWS Session early to allow SSM parameter loading
 aws_session = boto3.Session(region_name=AWS_REGION)
 ssm_client = aws_session.client('ssm')
 
@@ -39,65 +35,66 @@ def get_ssm_parameter(param_path: str, fallback_env: str) -> str:
         logger.error(f"SSM path {param_path} not found or inaccessible ({e}). Falling back to environment variable.")
         return os.getenv(fallback_env, "")
 
-AWS_PROMPT_ID = get_ssm_parameter("/config/analyzer_agent/prompt_id", "AWS_PROMPT_ID")
-AWS_PROMPT_VERSION = get_ssm_parameter("/config/analyzer_agent/prompt_version", "AWS_PROMPT_VERSION")
+AWS_PROMPT_ID = get_ssm_parameter("/config/summarizer_agent/prompt_id", "AWS_PROMPT_ID")
+AWS_PROMPT_VERSION = get_ssm_parameter("/config/summarizer_agent/prompt_version", "AWS_PROMPT_VERSION")
 
+@tool
+def cache_anchor_tool() -> str:
+    """A structural anchor to hold Anthropic cache wall inplace. Do not call this"""
+    return "ok"
+
+tools = [cache_anchor_tool]
 bedrock_agent_client = aws_session.client('bedrock-agent')
 
-#fetching system prompt
-def get_bedrock_system_prompt(prompt_id: str, prompt_version: str, **variables) -> str:
-    """
-    Fetches the system prompt from AWS Bedrock using a retry mechanism.
-    Injects dynamic variables into the prompt text.
-    """
+def get_bedrock_system_prompt(prompt_id: str, prompt_version: str, **variables) -> dict:
+    """Fetches strictly the prompt text from AWS Bedrock."""
+    PROMPT = {
+        "text": "",
+    }
+    
     if not prompt_id:
         logger.warning("AWS_PROMPT_ID is not set. Returning empty configuration.")
-        return ""
+        return PROMPT["text"]
 
     max_retries = 3
     for attempt in range(1, max_retries + 1):
         try:
-            logger.info(f"Attempting to fetch configuration from Bedrock (ID: {prompt_id}, Version: {prompt_version}) - Try {attempt}")
+            logger.info(f"Attempting to fetch prompt from Bedrock (ID: {prompt_id}, Version: {prompt_version}) - Try {attempt}")
             
             response = bedrock_agent_client.get_prompt(
                 promptIdentifier=prompt_id,
                 promptVersion=prompt_version
             )
+            prompt_data = response.get("variants", [])[0].get("templateConfiguration", {})
             
-            variants = response.get("variants", [])
-            if not variants:
-                logger.error(f"No variants found for prompt {prompt_id}.")
-                return ""
-                
-            template_config = variants[0].get("templateConfiguration", {})
-            prompt_text = template_config.get("text", {}).get("text", "")
+            if "text" in prompt_data:
+                PROMPT["text"] = prompt_data["text"].get("text", "")
+            elif "chat" in prompt_data:
+                chat_data = prompt_data["chat"]
+                for sys_block in chat_data.get("system", []):
+                    if "text" in sys_block:
+                        PROMPT["text"] += sys_block["text"]
+                if not PROMPT["text"]:
+                    for msg in chat_data.get("messages", []):
+                        for content in msg.get("content", []):
+                            if "text" in content:
+                                PROMPT["text"] += content["text"]
 
-            if not prompt_text:
-                logger.error(f"Prompt text is empty in the response.")
-                return ""
-
-            # Inject dynamic variables
             for key, value in variables.items():
-                prompt_text = prompt_text.replace(f"{{{{{key}}}}}", str(value))
-
-            logger.info(f"Successfully fetched prompt from Bedrock prompt management: {prompt_text}")
-            
-            return prompt_text
+                PROMPT["text"] = PROMPT["text"].replace(f"{{{{{key}}}}}", str(value))
+            logger.info(f"Successfully fetched prompt from Bedrock.")
+            logger.info(f"Prompt text: {PROMPT['text']}")
+            return PROMPT["text"]
 
         except Exception as e:
             if attempt < max_retries:
-                logger.warning(f"Attempt {attempt} failed due to error: {e}. Retrying in 2 seconds...")
                 time.sleep(2)
             else:
-                logger.error(f"Failed to fetch configuration from Bedrock after {max_retries} attempts due to error: {e}.")
-                return ""
+                logger.error(f"Failed to fetch prompt from Bedrock after {max_retries} attempts: {e}.")
+                return PROMPT["text"]
 
-# Define dynamic variables based on environment and constants
-dynamic_prompt_variables = {
-    "knowledge_base_id": os.getenv("KNOWLEDGE_BASE_ID","")
-}
+dynamic_prompt_variables = {}
 
-# Fetch the combined configuration dictionary
 SYSTEM_PROMPT = get_bedrock_system_prompt(
     prompt_id=AWS_PROMPT_ID,
     prompt_version=AWS_PROMPT_VERSION,
@@ -105,214 +102,12 @@ SYSTEM_PROMPT = get_bedrock_system_prompt(
 )
 
 # ========================================================
-# Structured Output Models
-# ========================================================
-
-class Incident(BaseModel):
-    """ServiceNow incident record"""
-
-    incident_id: Optional[str] = Field(
-        default=None,
-        description="Incident identifier"
-    )
-
-    short_description: Optional[str] = Field(
-        default=None,
-        description="Incident short description"
-    )
-
-    state: Optional[str] = Field(
-        default=None,
-        description="Incident state"
-    )
-
-    priority: Optional[str] = Field(
-        default=None,
-        description="Incident priority"
-    )
-
-    category: Optional[str] = Field(
-        default=None,
-        description="Incident category"
-    )
-
-    affected_system: Optional[str] = Field(
-        default=None,
-        description="Affected system"
-    )
-
-
-class KnowledgeBaseInsight(BaseModel):
-    """Knowledge base enrichment record"""
-
-    incident_id: Optional[str] = Field(
-        default=None,
-        description="Associated incident identifier"
-    )
-
-    summary: Optional[str] = Field(
-        default=None,
-        description="Knowledge base summary"
-    )
-
-    resolution: Optional[str] = Field(
-        default=None,
-        description="Knowledge base resolution"
-    )
-
-
-class IncidentAnalysis(BaseModel):
-    """Final analyzer output"""
-
-    incident_count: int = Field(
-        default=0,
-        ge=0,
-        description="Number of incidents returned"
-    )
-
-    incidents: List[Incident] = Field(
-        default_factory=list,
-        description="Returned incident records"
-    )
-
-    knowledge_base_record_count: int = Field(
-        default=0,
-        ge=0,
-        description="Number of KB records returned"
-    )
-
-    knowledge_base_insights: List[KnowledgeBaseInsight] = Field(
-        default_factory=list,
-        description="Knowledge base insights"
-    )
-
-@tool
-def knowledge_base_search(query: str) -> str:
-    """Search the Bedrock knowledge base and return structured KB records."""
-
-    logger.info(
-        "Executing knowledge_base_search tool. Query: '%s'",
-        query
-    )
-
-    kb_id = os.getenv("KNOWLEDGE_BASE_ID", "")
-    region = os.getenv("AWS_REGION", "us-east-1")
-
-    if not kb_id:
-        logger.error("KNOWLEDGE_BASE_ID is missing")
-        return json.dumps(
-            {
-                "record_count": 0,
-                "records": [],
-                "error": "KNOWLEDGE_BASE_ID not configured"
-            }
-        )
-
-    tool_input = {
-        "toolUseId": "kb-search",
-        "input": {
-            "text": query,
-            "knowledgeBaseId": kb_id,
-            "region": region,
-            "numberOfResults": 5,
-            "score": 0.35,
-        },
-    }
-
-    try:
-        response = _kb_retrieve_fn(tool_input)
-
-        #logger.info("[KB_RAW_RESPONSE] %s", response)
-
-        status = response.get("status", "error")
-        content = response.get("content", [])
-
-        logger.info(
-            "[KB_CONTENT_COUNT] %s",
-            len(content)
-        )
-
-        if status != "success" or not content:
-            return json.dumps(
-                {
-                    "record_count": 0,
-                    "records": []
-                }
-            )
-
-        kb_text = content[0].get("text", "")
-
-        # Extract KB incidents - UPDATED REGEX LOGIC
-        incident_ids = re.findall(
-            r"Incident ID:\s*(INC\d+)",
-            kb_text,
-            flags=re.IGNORECASE
-        )
-
-        summaries = re.findall(
-            r"Summary:\s*(.*?)(?=\n\s*(?:Description|Resolution|Score):?|$)",
-            kb_text,
-            flags=re.DOTALL | re.IGNORECASE,
-        )
-
-        resolutions = re.findall(
-            r"Resolution:\s*(.*?)(?=\n\s*(?:Score|Incident ID):?|$)",
-            kb_text,
-            flags=re.DOTALL | re.IGNORECASE,
-        )
-
-        records = []
-
-        for idx, incident_id in enumerate(incident_ids):
-            records.append(
-                {
-                    "incident_id": incident_id,
-                    "summary": (
-                        summaries[idx].strip()
-                        if idx < len(summaries)
-                        else ""
-                    ),
-                    "resolution": (
-                        resolutions[idx].strip()
-                        if idx < len(resolutions)
-                        else ""
-                    ),
-                }
-            )
-
-        structured_response = {
-            "record_count": len(records),
-            "records": records,
-        }
-
-        #logger.info("[KB_STRUCTURED_RESPONSE] %s", structured_response)
-
-        return json.dumps(structured_response)
-
-    except Exception as e:
-        logger.exception(
-            "Error in knowledge_base_search"
-        )
-
-        return json.dumps(
-            {
-                "record_count": 0,
-                "records": [],
-                "error": str(e),
-            }
-        )
-
-
-# ========================================================
 # LOGGING METRICS (Strictly Per-Request)
 # ========================================================
 def log_metrics_on_complete(event: AfterInvocationEvent) -> None:
-    """Triggered automatically by Strands strictly for the current HTTP request."""
-    
     if not event.result or not event.result.metrics:
         return
 
-    # Extract metrics ONLY for the single, latest request invocation
     if event.result.metrics.agent_invocations:
         latest_invocation = event.result.metrics.agent_invocations[-1]
         metrics = latest_invocation.usage
@@ -326,9 +121,7 @@ def log_metrics_on_complete(event: AfterInvocationEvent) -> None:
     cache_w = metrics.get('cacheWriteInputTokens', 0)
     cache_r = metrics.get('cacheReadInputTokens', 0)
     total_tokens = metrics.get('totalTokens', 0)
-
-    # Calculate actual billed tokens
-    billed_tokens = (input_t + output_t) - cache_r
+    billed_tokens = total_tokens - cache_r
 
     dashboard = (
         f"\n"
@@ -342,64 +135,54 @@ def log_metrics_on_complete(event: AfterInvocationEvent) -> None:
         f"│ ⚡ Cache Read      : {cache_r} tokens (Discounted!)\n"
         f"├──────────────────────────────────────────────────┤\n"
         f"│ 📈 Total Processed : {total_tokens} tokens\n"
+        f"│ 📈 Billed Tokens   : {billed_tokens} tokens\n"
         f"└──────────────────────────────────────────────────┘\n"
     )
-    
     logger.info(dashboard)
 
-# ========================================================
-#  RUNTIME AND ROUTING UTILITY
-# ========================================================
 def main():
-    logger.info("Starting up AnalyzerAgent system bootstrap lifecycle...")
-    
     is_local = os.getenv("ENV", "prod").lower() == "local"
-    logger.info("Target execution mode evaluated: [ENV=%s] (is_local=%s)", os.getenv("ENV", "prod"), is_local)
+
+    # 1. Fetch DB values via Shared Library
+    db_config = fetch_agent_config(agent_name="agent1")
+    TTL = db_config.get("ttl", "5m")
+
+    # 2. Build system blocks and dynamically check caching flag from DB
+    system_blocks = [SystemContentBlock(text=SYSTEM_PROMPT)]
+    if db_config.get("enable_system_cache", False):
+        cache_config = {"type": "default"}
+
+        if db_config.get("ttl") == "1hr":
+            cache_config["ttl"] = db_config["ttl"]
+
+        system_blocks.append(SystemContentBlock(cachePoint=cache_config))
+        logger.info(f"System cache point dynamically applied from DB flag: {cache_config}")
     
-    logger.info("Initializing Agent and tools within active OpenTelemetry context framework...")
+    # 3. Load model using DB parameters (model_id, temp, top_k, top_p)
+    MODEL_ID_DB = load_model(agent_name="agent1", db_config=db_config)
+    logger.info("Fetched configuration and initialized model:")
+    print(vars(MODEL_ID_DB))
+    
+    summarizer_agent = Agent(
+        name="Summarizer Agent",    
+        description="Provides an immediate specialist summary on incident data.", 
+        model=MODEL_ID_DB,
+        system_prompt=system_blocks,
+        tools=tools
+    )
 
-    try:
-        logger.info("Querying MCP Client tool discovery endpoint...")
-        tools = build_tools_from_mcp()
-        logger.info("MCP discovery complete. Discovered and parsed %d dynamic tools.", len(tools))
-        
-        logger.info("Loading language intelligence model configuration...")
-        llm_model = load_model()
-        logger.info("LLM engine loaded successfully: %s", getattr(llm_model, "model_id", "Default Model Instance"))
-
-        logger.info("Assembling Strands Agent runtime configuration framework...")
-        analyzer_agent = Agent(
-            name="Analyzer Agent",    
-            description="Provides insight on incident data.",  
-            model=llm_model,
-            system_prompt=[
-                SystemContentBlock(text=SYSTEM_PROMPT), 
-                SystemContentBlock(cachePoint={"type": "default"})     
-            ],
-            tools=[*tools, knowledge_base_search],
-            structured_output_model=IncidentAnalysis,
-        )
-        logger.info("Strands Agent assembly verified successfully.")
-
-        analyzer_agent.add_hook(log_metrics_on_complete, AfterInvocationEvent)
-
-    except Exception as bootstrap_err:
-        logger.critical("Fatal crash experienced during target component assembly pipeline initialization.", exc_info=True)
-        raise bootstrap_err
+    summarizer_agent.add_hook(log_metrics_on_complete, AfterInvocationEvent)
 
     if is_local:
-        logger.info("Configuring A2AServer routing interface loop on target port: 9002")
+        logger.info("Running Summarizer Agent in LOCAL mode on port 9003...")
         a2a_server = A2AServer(
-            agent=analyzer_agent, 
-            port=9002
+            agent=summarizer_agent, 
+            port=9003
         )
-        logger.info("Handing off runtime thread execution control to local HTTP polling loop...")
         a2a_server.serve()
     else:
-        logger.info("Building production StrandsA2AExecutor. Running in AWS Bedrock AgentCore runtime environment...")
-        executor = StrandsA2AExecutor(agent=analyzer_agent)
-        
-        logger.info("Running in AWS PRODUCTION environment via Bedrock AgentCore Runtime...")
+        logger.info("Running Summarizer Agent in AWS PRODUCTION environment via Bedrock AgentCore Runtime...")
+        executor = StrandsA2AExecutor(agent=summarizer_agent)
         serve_a2a(executor)
 
 if __name__ == "__main__":
