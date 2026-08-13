@@ -1,238 +1,81 @@
 import os
-import logging
-import time
-import boto3
 from dotenv import load_dotenv
-from strands import Agent
-from strands.multiagent.a2a.executor import StrandsA2AExecutor
-from strands.multiagent.a2a import A2AServer
-from bedrock_agentcore.runtime import serve_a2a
-from strands.hooks import AfterInvocationEvent
-from strands.tools import tool
-from strands.types.content import SystemContentBlock
-
-from model.load import load_model
-from model.load import fetch_db_record
+from strands.models.bedrock import BedrockModel, CacheToolsConfig
+import logging
+import psycopg2
+from psycopg2.extras import DictCursor
 
 load_dotenv()
-AWS_REGION = os.getenv("AWS_REGION", "")
-
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-logging.getLogger("strands.telemetry.metrics").setLevel(logging.INFO)
 
-aws_session = boto3.Session(region_name=AWS_REGION)
+# Database configuration with your local setup as fallbacks
+DB_HOST = os.getenv("DB_HOST", "localhost")
+DB_PORT = os.getenv("DB_PORT", "5432")
+DB_NAME = os.getenv("DB_NAME", "model_config_db")
+DB_USER = os.getenv("DB_USER", "postgres")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "Db@123")
 
-# ========================================================
-# DATABASE QUERY
-# ========================================================
-AGENT_CONFIG_QUERY = """
-    SELECT 
-        llm.model_id, llm.temperature, llm.top_k, 
-        llm.prompt_caching_option, llm.prompt_cache_ttl,
-        p.prompt_id, p.prompt_version
-    FROM agent_llm_config llm
-    LEFT JOIN agent_prompt_config p ON llm.agent_id = p.agent_id
-    WHERE llm.agent_name = %s;
-"""
-logger.info("Fetching config for 'SummarizerAgent' from Database...")
-raw_config = fetch_db_record(query=AGENT_CONFIG_QUERY, params=("SummarizerAgent",))
-logger.info(f"Raw config fetched from DB: {raw_config}")
+AWS_GUARDRAIL_IDENTIFIER = os.getenv("AWS_GUARDRAIL_IDENTIFIER", "")
 
-if raw_config:
-    # Map enum strings into old boolean logic expected by the agent
-    cache_option = raw_config.get('prompt_caching_option', 'none')
-    raw_config['enable_system_cache'] = cache_option in ['system', 'system_and_tools']
-    raw_config['enable_tool_cache'] = cache_option == 'system_and_tools'
-    raw_config['prompt_cache_ttl'] = raw_config.get('prompt_cache_ttl') or '5m'
-    
-    db_config_global = raw_config
-    logger.info("Successfully loaded database configuration.")
-else:
-    logger.warning("No config found in DB for 'SummarizerAgent'. Falling back to defaults.")
-    db_config_global = {
-        "model_id": "global.anthropic.claude-sonnet-4-5-20250929-v1:0",
-        "temperature": 0.20,
-        "top_k": 50,
-        "enable_system_cache": True,
-        "enable_tool_cache": False,
-        "prompt_id": "FK0MKCLEEV",
-        "prompt_version": "3",
-        "prompt_caching_option": "system",
-        "prompt_cache_ttl": "5m"
-    }
-
-# Extract specific values for prompt fetching
-AWS_PROMPT_ID = db_config_global.get("prompt_id", "")
-AWS_PROMPT_VERSION = db_config_global.get("prompt_version", "")
-
-tools = []
-bedrock_agent_client = aws_session.client('bedrock-agent')
-
-def get_bedrock_system_prompt(prompt_id: str, prompt_version: str, **variables) -> dict:
-    """Fetches strictly the prompt text from AWS Bedrock."""
-    PROMPT = {
-        "text": "",
-    }
-    
-    if not prompt_id:
-        logger.warning("AWS_PROMPT_ID is not set. Returning empty configuration.")
-        return PROMPT["text"]
-
-    max_retries = 3
-    for attempt in range(1, max_retries + 1):
-        try:
-            logger.info(f"Attempting to fetch prompt from Bedrock (ID: {prompt_id}, Version: {prompt_version}) - Try {attempt}")
-            
-            response = bedrock_agent_client.get_prompt(
-                promptIdentifier=prompt_id,
-                promptVersion=prompt_version
-            )
-            prompt_data = response.get("variants", [])[0].get("templateConfiguration", {})
-            
-            if "text" in prompt_data:
-                PROMPT["text"] = prompt_data["text"].get("text", "")
-            elif "chat" in prompt_data:
-                chat_data = prompt_data["chat"]
-                for sys_block in chat_data.get("system", []):
-                    if "text" in sys_block:
-                        PROMPT["text"] += sys_block["text"]
-                if not PROMPT["text"]:
-                    for msg in chat_data.get("messages", []):
-                        for content in msg.get("content", []):
-                            if "text" in content:
-                                PROMPT["text"] += content["text"]
-
-            for key, value in variables.items():
-                PROMPT["text"] = PROMPT["text"].replace(f"{{{{{key}}}}}", str(value))
-            logger.info(f"Successfully fetched prompt from Bedrock.")
-            logger.info(f"Prompt text: {PROMPT['text']}")
-            return PROMPT["text"]
-
-        except Exception as e:
-            if attempt < max_retries:
-                time.sleep(2)
-            else:
-                logger.error(f"Failed to fetch prompt from Bedrock after {max_retries} attempts: {e}.")
-                return PROMPT["text"]
-
-dynamic_prompt_variables = {}
-
-SYSTEM_PROMPT = get_bedrock_system_prompt(
-    prompt_id=AWS_PROMPT_ID,
-    prompt_version=AWS_PROMPT_VERSION,
-    **dynamic_prompt_variables
-)
-
-# ========================================================
-# LOGGING METRICS (Strictly Per-Request)
-# ========================================================
-def log_metrics_on_complete(event: AfterInvocationEvent) -> None:
-    if not event.result or not event.result.metrics:
-        return
-
-    if event.result.metrics.agent_invocations:
-        latest_invocation = event.result.metrics.agent_invocations[-1]
-        metrics = latest_invocation.usage
-        cycle_count = len(latest_invocation.cycles)
-    else:
-        metrics = event.result.metrics.accumulated_usage
-        cycle_count = 1
-
-    input_t = metrics.get('inputTokens', 0)
-    output_t = metrics.get('outputTokens', 0)
-    cache_w = metrics.get('cacheWriteInputTokens', 0)
-    cache_r = metrics.get('cacheReadInputTokens', 0)
-    total_tokens = metrics.get('totalTokens', 0)
-    billed_tokens = total_tokens - cache_r
-
-    dashboard = (
-        f"\n"
-        f"┌──────────────────────────────────────────────────┐\n"
-        f"│ 📊 ANALYZER SINGLE-REQUEST METRICS               │\n"
-        f"├──────────────────────────────────────────────────┤\n"
-        f"│ 🔄 Agent Cycles    : {cycle_count}\n"
-        f"│ 📥 Standard Input  : {input_t} tokens\n"
-        f"│ 📤 Output Generated: {output_t} tokens\n"
-        f"│ 💾 Cache Written   : {cache_w} tokens\n"
-        f"│ ⚡ Cache Read      : {cache_r} tokens (Discounted!)\n"
-        f"├──────────────────────────────────────────────────┤\n"
-        f"│ 📈 Total Processed : {total_tokens} tokens\n"
-        f"│ 📈 Billed Tokens   : {billed_tokens} tokens\n"
-        f"└──────────────────────────────────────────────────┘\n"
-    )
-    logger.info(dashboard)
-
-# ========================================================
-# IN-MEMORY PYTHON CACHING MECHANISM
-# ========================================================
-_CACHED_DB_CONFIG = None
-
-def get_cached_agent_config(agent_name: str) -> dict:
+def fetch_db_record(query: str, params: tuple = ()) -> dict:
     """
-    Fetches agent config from memory. 
-    If not initialized, fetches from the DB once and stores it in a Python variable.
-    Requires restarting the process to fetch fresh DB values.
+    Generic function to fetch a single record from the database.
+    Can be reused for any SQL query and table.
     """
-    global _CACHED_DB_CONFIG
-    
-    # 1. Try to read from Python memory
-    if _CACHED_DB_CONFIG is not None:
-        logger.info(f"⚡ [MEMORY CACHE HIT] Using stored config for '{agent_name}'.")
-        return _CACHED_DB_CONFIG
-
-    # 2. Cache miss: Fetch from DB
-    logger.info(f"🐌 [CACHE MISS] Fetching config for '{agent_name}' from Database...")
-    _CACHED_DB_CONFIG = fetch_agent_config(agent_name=agent_name)
-    
-    logger.info(f"💾 Saved config for '{agent_name}' to application memory.")
-    return _CACHED_DB_CONFIG
-
-
-def main():
-    is_local = os.getenv("ENV", "prod").lower() == "local"
-
-    # 1. Build system blocks and dynamically check caching flag from globally fetched DB config
-    system_blocks = [SystemContentBlock(text=SYSTEM_PROMPT)]
-
-    caching_option = db_config_global.get("prompt_caching_option", "none")
-
-    if caching_option in ['system', 'system_and_tools']:
-        cache_config = {"type": "default"}
-
-        TTL = db_config_global.get("prompt_cache_ttl", "5m")
-        if TTL:
-            cache_config["ttl"] = TTL
-
-        system_blocks.append(SystemContentBlock(cachePoint=cache_config))
-        logger.info(f"System cache point dynamically applied from DB flag: {cache_config}")
-    
-    # 2. Load model passing the direct config
-    MODEL_ID_DB = load_model(db_config=db_config_global)
-    logger.info("Fetched configuration and initialized model:")
-    print(vars(MODEL_ID_DB))
-    
-    summarizer_agent = Agent(
-        name="Summarizer Agent",    
-        description="Provides an immediate specialist summary on incident data.", 
-        model=MODEL_ID_DB,
-        system_prompt=system_blocks,
-        tools=tools
-    )
-
-    summarizer_agent.add_hook(log_metrics_on_complete, AfterInvocationEvent)
-
-    if is_local:
-        logger.info("Running Summarizer Agent in LOCAL mode on port 9003...")
-        a2a_server = A2AServer(
-            agent=summarizer_agent, 
-            port=9003
+    conn = None
+    try:
+        conn = psycopg2.connect(
+            host=DB_HOST,
+            port=DB_PORT,
+            database=DB_NAME,
+            user=DB_USER,
+            password=DB_PASSWORD
         )
-        a2a_server.serve()
-    else:
-        logger.info("Running Summarizer Agent in AWS PRODUCTION environment via Bedrock AgentCore Runtime...")
-        executor = StrandsA2AExecutor(agent=summarizer_agent)
-        serve_a2a(executor)
+        
+        cursor = conn.cursor(cursor_factory=DictCursor)
+        cursor.execute(query, params)
+        result = cursor.fetchone()
+        cursor.close()
+        
+        if result:
+            logger.info(f"Successfully fetched DB record.")
+            return dict(result)
+        else:
+            logger.warning("No records found for the given query.")
+            return {}
 
-if __name__ == "__main__":
-    main()
+    except psycopg2.Error as e:
+        logger.error(f"Database error while executing query: {e}")
+        return {}
+        
+    finally:
+        if conn is not None:
+            conn.close()
+
+def load_model(db_config: dict) -> BedrockModel:
+    """
+    Instantiates the BedrockModel using passed DB configuration values. 
+    """
+    model_kwargs = {
+        "model_id": db_config.get("model_id", "global.anthropic.claude-sonnet-4-5-20250929-v1:0"),
+        "temperature": float(db_config.get("temperature", 0.20)),
+        "additional_request_fields" : {
+            "top_k": int(db_config.get("top_k", 50))
+        },
+        "guardrail_id": AWS_GUARDRAIL_IDENTIFIER,
+        "guardrail_version": "1",
+        "guardrail_trace": "enabled"
+    }
+
+    # Enable tool caching if specified in DB config
+    caching_option = db_config.get("prompt_caching_option", "none")
+    ttl_val = db_config.get("prompt_cache_ttl", "5m")
+
+    if caching_option == "system_and_tools":
+        model_kwargs["cache_tools"] = CacheToolsConfig(
+            type="default",
+            ttl=ttl_val
+        )
+        print("Tool caching dynamically enabled from config.")
+        
+    return BedrockModel(**model_kwargs)
