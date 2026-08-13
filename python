@@ -1,6 +1,7 @@
 (agent) vuniyal@LIN-DK4CBV3:~/git/summarizeragent_agent/app/agent$ uv run main.py
 INFO:__main__:Fetching config for 'SummarizerAgent' from Database...
 INFO:model.load:Successfully fetched DB record.
+INFO:__main__:Raw config fetched from DB: {'model_id': 'global.anthropic.claude-sonnet-4-5-20250929-v1:0', 'temperature': Decimal('0.700'), 'top_k': 100, 'prompt_caching_option': 'system', 'prompt_cache_ttl': '1h', 'prompt_id': 'FK0MKCLEEV', 'prompt_version': '3'}
 INFO:__main__:Successfully loaded database configuration.
 INFO:botocore.credentials:Found credentials in shared credentials file: ~/.aws/credentials
 INFO:__main__:Attempting to fetch prompt from Bedrock (ID: FK0MKCLEEV, Version: 3) - Try 1
@@ -115,11 +116,11 @@ End of operational mandate. Maintain strict formatting.
 INFO:__main__:System cache point dynamically applied from DB flag: {'type': 'default', 'ttl': '1h'}
 INFO:botocore.credentials:Found credentials in shared credentials file: ~/.aws/credentials
 INFO:__main__:Fetched configuration and initialized model:
-{'config': {'model_id': 'global.anthropic.claude-sonnet-4-5-20250929-v1:0', 'include_tool_result_status': 'auto', 'temperature': 0.7, 'additional_request_fields': {'top_k': 100}, 'guardrail_id': '', 'guardrail_version': '1', 'guardrail_trace': 'enabled'}, 'client': <botocore.client.BedrockRuntime object at 0x7d4f09a961e0>}
+{'config': {'model_id': 'global.anthropic.claude-sonnet-4-5-20250929-v1:0', 'include_tool_result_status': 'auto', 'temperature': 0.7, 'additional_request_fields': {'top_k': 100}, 'guardrail_id': '', 'guardrail_version': '1', 'guardrail_trace': 'enabled'}, 'client': <botocore.client.BedrockRuntime object at 0x78a79238e3c0>}
 INFO:__main__:Running Summarizer Agent in LOCAL mode on port 9003...
 INFO:strands.multiagent.a2a.server:Strands' integration with A2A is experimental. Be aware of frequent breaking changes.
 INFO:strands.multiagent.a2a.server:Starting Strands A2A server...
-INFO:     Started server process [45584]
+INFO:     Started server process [46645]
 INFO:     Waiting for application startup.
 INFO:     Application startup complete.
 INFO:     Uvicorn running on http://127.0.0.1:9003 (Press CTRL+C to quit)
