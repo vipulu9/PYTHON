@@ -1,108 +1,80 @@
-CREATE EXTENSION IF NOT EXISTS pgcrypto;
-CREATE TABLE agent_llm_config (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+import os
+from dotenv import load_dotenv
+from strands.models.bedrock import BedrockModel, CacheToolsConfig
+import logging
+import psycopg2
+from psycopg2.extras import DictCursor
 
-    agent_id VARCHAR(255) NOT NULL,
-    agent_name VARCHAR(255) NOT NULL,
+load_dotenv()
+logger = logging.getLogger(__name__)
 
-    model_id VARCHAR(255) NOT NULL,
-    provider_name VARCHAR(128) NOT NULL,
-    model_name VARCHAR(255) NOT NULL,
+# Database configuration with your local setup as fallbacks
+DB_HOST = os.getenv("DB_HOST", "localhost")
+DB_PORT = os.getenv("DB_PORT", "5432")
+DB_NAME = os.getenv("DB_NAME", "model_config_db")
+DB_USER = os.getenv("DB_USER", "postgres")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "Db@123")
 
-    temperature NUMERIC(4,3) NOT NULL
-        CHECK (temperature >= 0 AND temperature <= 2),
+AWS_GUARDRAIL_IDENTIFIER = os.getenv("AWS_GUARDRAIL_IDENTIFIER", "")
 
-    top_k INTEGER NOT NULL
-        CHECK (top_k >= 0 AND top_k <= 500),
+def fetch_db_record(query: str, params: tuple = ()) -> dict:
+    """
+    Generic function to fetch a single record from the database.
+    Can be reused for any SQL query and table.
+    """
+    conn = None
+    try:
+        conn = psycopg2.connect(
+            host=DB_HOST,
+            port=DB_PORT,
+            database=DB_NAME,
+            user=DB_USER,
+            password=DB_PASSWORD
+        )
+        
+        cursor = conn.cursor(cursor_factory=DictCursor)
+        cursor.execute(query, params)
+        result = cursor.fetchone()
+        cursor.close()
+        
+        if result:
+            logger.info(f"Successfully fetched DB record.")
+            return dict(result)
+        else:
+            logger.warning("No records found for the given query.")
+            return {}
 
-    max_tokens INTEGER NOT NULL
-        CHECK (max_tokens >= 1 AND max_tokens <= 200000),
+    except psycopg2.Error as e:
+        logger.error(f"Database error while executing query: {e}")
+        return {}
+        
+    finally:
+        if conn is not None:
+            conn.close()
 
-    prompt_caching_option VARCHAR(32) NOT NULL DEFAULT 'none'
-        CHECK (
-            prompt_caching_option IN (
-                'none',
-                'system',
-                'system_and_tools'
-            )
-        ),
+def load_model(db_config: dict) -> BedrockModel:
+    """
+    Instantiates the BedrockModel using passed DB configuration values. 
+    """
+    model_kwargs = {
+        "model_id": db_config.get("model_id", "global.anthropic.claude-sonnet-4-5-20250929-v1:0"),
+        "temperature": float(db_config.get("temperature", 0.20)),
+        "additional_request_fields" : {
+            "top_k": int(db_config.get("top_k", 50))
+        },
+        "guardrail_id": AWS_GUARDRAIL_IDENTIFIER,
+        "guardrail_version": "1",
+        "guardrail_trace": "enabled"
+    }
+    
+    # Enable tool caching if specified in DB config
+    TTL = db_config.get("ttl", "5m")
 
-    prompt_cache_ttl VARCHAR(8)
-        CHECK (
-            prompt_cache_ttl IS NULL
-            OR prompt_cache_ttl IN ('5m', '1h')
-        ),
-
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-
-    CHECK (
-        prompt_caching_option <> 'none'
-        OR prompt_cache_ttl IS NULL
-    )
-);
-CREATE TABLE agent_prompt_config (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-
-    agent_id VARCHAR(255) NOT NULL,
-    agent_name VARCHAR(255) NOT NULL,
-
-    prompt_id VARCHAR(255) NOT NULL,
-    prompt_name VARCHAR(255) NOT NULL,
-    prompt_version VARCHAR(64) NOT NULL,
-
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-CREATE INDEX idx_agent_llm_config_agent_id
-ON agent_llm_config(agent_id);
-
-CREATE INDEX idx_agent_prompt_config_agent_id
-ON agent_prompt_config(agent_id);
-
-INSERT INTO agent_llm_config (
-    agent_id,
-    agent_name,
-    model_id,
-    provider_name,
-    model_name,
-    temperature,
-    top_k,
-    max_tokens,
-    prompt_caching_option,
-    prompt_cache_ttl
-)
-VALUES (
-    'agent-001',
-    'SummarizerAgent',
-    'global.anthropic.claude-sonnet-4-5-20250929-v1:0',
-    'Anthropic',
-    'Claude 3.5 Sonnet',
-    0.7,
-    100,
-    4096,
-    'system',
-    '1h'
-);
-
-INSERT INTO agent_prompt_config (
-    agent_id,
-    agent_name,
-    prompt_id,
-    prompt_name,
-    prompt_version
-)
-VALUES (
-    'agent-001',
-    'SummarizerAgent',
-    'FK0MKCLEEV',
-    'summarizer_agent_system_prompt',
-    '3'
-);
-
-output
-
-                  id                  |   agent_id   |     agent_name      | prompt_id  |          prompt_name           | prompt_version |          created_at           |          updated_at           
---------------------------------------+--------------+---------------------+------------+--------------------------------+----------------+-------------------------------+-------------------------------
- c4f0ed25-04a8-4168-a4fa-08319bc46fb4 | agent-001    | SummarizerAgent     | FK0MKCLEEV | summarizer_agent_system_prompt | 3              | 2026-08-12 06:46:14.200779+00 | 2026-08-12 06:46:14.200779+00
- ea154357-0428-40b2-b1ba-5fc8dd496438 | 7ZuK4LvvoFJM | AnalyzerAgentRecord | 4YMRN8HBVE | analyzer_agent_system_prompt   | 2              | 2026-08-12 09:45:24.68221+00  | 2026-08-12 09:45:24.68221+00
+    if db_config.get("enable_tool_cache"):
+        model_kwargs["cache_tools"] = CacheToolsConfig(
+            type="default",
+            ttl=TTL
+        )
+        print("Tool caching dynamically enabled from config.")
+        
+    return BedrockModel(**model_kwargs)
