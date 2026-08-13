@@ -1,146 +1,98 @@
-(agent) vuniyal@LIN-DK4CBV3:~/git/summarizeragent_agent/app/agent$ # 1. Go back to your agent directory
-cd ~/git/summarizeragent_agent/app/agent
+vuniyal@LIN-DK4CBV3:~/git/charter-web-app$ grep -R "axios" src
+src/api/prompts.ts:import axios from 'axios'
+src/api/prompts.ts:const promptApiClient = axios.create({
+src/api/prompts.ts:  if (axios.isAxiosError(error)) {
+src/api/client.ts:import axios from 'axios'
+src/api/client.ts:export const apiClient = axios.create({
+src/features/agent-config/AgentConfigPage.tsx:import axios from 'axios'
+src/features/agent-config/AgentConfigPage.tsx:  if (axios.isAxiosError(error)) {
+vuniyal@LIN-DK4CBV3:~/git/charter-web-app$ grep -R "fetch(" src
+src/api/hostAgentPrivilege.ts:  const res = await fetch(`${SNOW_BASE}/agent/privileges`);
+src/api/hostAgentPrivilege.ts:  const res = await fetch(`${SNOW_BASE}/agent/privileges/update`, {
+src/api/chat.ts:  const res = await fetch(`${BASE_URL}/chat`, {
+src/api/chat.ts:  const res = await fetch(`${BASE_URL}/chat`, {
+src/api/servicenow.ts:  const res = await fetch(`${SNOW_BASE}/servicenow/incidents/${incidentId}/work_notes`, {
+src/api/servicenow.ts:  const res = await fetch(`${SNOW_BASE}/servicenow/incidents?${searchParams.toString()}`);
+src/api/servicenow.ts:  const res = await fetch(`${SNOW_BASE}/servicenow/incidents/${id}`);
+src/api/servicenow.ts:  const res = await fetch(`${SNOW_BASE}/servicenow/incidents/${incidentId}/work_notes`);
+src/features/otel-test/OtelDataPublishPage.tsx:  await fetch(TOPOLOGY_HEALTH_URL(device), {
+src/features/otel-test/OtelDataPublishPage.tsx:      const response = await fetch(OTEL_DATA_URL, {
+src/features/prompt-management/PromptListPage.tsx:          <Button variant="outline" onClick={() => query.refetch()}>
+src/features/prompt-management/PromptVersionsTab.tsx:          <Button variant="outline" size="sm" onClick={() => versionsQuery.refetch()}>
+vuniyal@LIN-DK4CBV3:~/git/charter-web-app$ grep -R "topology/nodes" src
+src/api/digitalTwin.ts: *   GET  /api/topology/nodes/health
+src/api/digitalTwin.ts: *   GET  /api/topology/nodes/:nodeId/health
+src/api/digitalTwin.ts: *   PUT  /api/topology/nodes/:nodeId/health      { status, actor? }
+src/api/digitalTwin.ts: *   POST /api/topology/nodes/:nodeId/health/toggle  { actor? }
+src/api/digitalTwin.ts: *   POST /api/topology/nodes/health/reset        { status, actor? }
+src/api/digitalTwin.ts:// ── GET /api/topology/nodes/:nodeId/health ─────────────────────────────────
+src/api/digitalTwin.ts:    `/topology/nodes/${encodeURIComponent(nodeId)}/health`,
+src/api/digitalTwin.ts:// ── PUT /api/topology/nodes/:nodeId/health ─────────────────────────────────
+src/api/digitalTwin.ts:    `/topology/nodes/${encodeURIComponent(nodeId)}/health`,
+src/api/digitalTwin.ts:// ── POST /api/topology/nodes/:nodeId/health/toggle ─────────────────────────
+src/api/digitalTwin.ts:    `/topology/nodes/${encodeURIComponent(nodeId)}/health/toggle`,
+src/api/digitalTwin.ts:// ── GET /api/topology/nodes/health ─────────────────────────────────────────
+src/api/digitalTwin.ts:  const { data } = await apiClient.get<NodeHealthEntry[]>('/topology/nodes/health')
+src/api/digitalTwin.ts:// ── POST /api/topology/nodes/health/reset ──────────────────────────────────
+src/api/digitalTwin.ts:    '/topology/nodes/health/reset',
+src/features/otel-test/OtelDataPublishPage.tsx:  `${import.meta.env.VITE_TOPOLOGY_MOCK_URL ?? 'http://darknoc.capgemini.com:3001'}/api/topology/nodes/${encodeURIComponent(device)}/health`
+src/mocks/handlers/topologyHealth.ts: *   GET  /api/topology/nodes/health
+src/mocks/handlers/topologyHealth.ts: *   GET  /api/topology/nodes/:nodeId/health
+src/mocks/handlers/topologyHealth.ts: *   PUT  /api/topology/nodes/:nodeId/health      { status, actor? }
+src/mocks/handlers/topologyHealth.ts: *   POST /api/topology/nodes/:nodeId/health/toggle  { actor? }
+src/mocks/handlers/topologyHealth.ts: *   POST /api/topology/nodes/health/reset        { status, actor? }
+src/mocks/handlers/topologyHealth.ts:const BASE = '/api/topology/nodes'
+src/mocks/handlers/topologyHealth.ts:// ── GET /api/topology/nodes/health ─────────────────────────────────────────
+src/mocks/handlers/topologyHealth.ts:// ── GET /api/topology/nodes/:nodeId/health ─────────────────────────────────
+src/mocks/handlers/topologyHealth.ts:// ── PUT /api/topology/nodes/:nodeId/health ─────────────────────────────────
+src/mocks/handlers/topologyHealth.ts:// ── POST /api/topology/nodes/:nodeId/health/toggle ─────────────────────────
+src/mocks/handlers/topologyHealth.ts:// ── POST /api/topology/nodes/health/reset ──────────────────────────────────
+vuniyal@LIN-DK4CBV3:~/git/charter-web-app$ grep -R "baseURL" src
+src/api/prompts.ts:  baseURL: PROMPT_MANAGEMENT_BACKEND_URL,
+src/api/client.ts:  baseURL: (
+vuniyal@LIN-DK4CBV3:~/git/charter-web-app$ grep -R "baseURL" src
+src/api/prompts.ts:  baseURL: PROMPT_MANAGEMENT_BACKEND_URL,
+src/api/client.ts:  baseURL: (
+vuniyal@LIN-DK4CBV3:~/git/charter-web-app$ cat vite.config.*
+import path from 'path'
+import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
 
-# 2. Add the newly built wheel file (using the absolute path to make it easy)
-uv add ~/git/base_agent/dist/base_agent-0.1.0-py3-none-any.whl
+function withSlashes(basePath: string) {
+  const trimmed = basePath.trim()
+  const withLeading = trimmed.startsWith('/') ? trimmed : `/${trimmed}`
+  return withLeading.endsWith('/') ? withLeading : `${withLeading}/`
+}
 
-# 3. Start your agent!
-uv run main.py
-Resolved 158 packages in 2.30s
-      Built agent @ file:///home/vuniyal/git/summarizeragent_agent/app/agent
-Prepared 4 packages in 3.04s
-Uninstalled 4 packages in 404ms
-Installed 5 packages in 129ms
- ~ agent==0.1.0 (from file:///home/vuniyal/git/summarizeragent_agent/app/agent)
- - awscrt==0.32.2
- + awscrt==0.36.0
- + base-agent==0.1.0 (from file:///home/vuniyal/git/base_agent/dist/base_agent-0.1.0-py3-none-any.whl)
- - boto3==1.43.36
- + boto3==1.43.70
- - botocore==1.43.36
- + botocore==1.43.70
-INFO:__main__:Fetching config for 'SummarizerAgent' from Database...
-INFO:base_agent.db:Successfully fetched DB record.
-INFO:__main__:Raw config fetched from DB: {'model_id': 'global.anthropic.claude-sonnet-4-5-20250929-v1:0', 'temperature': Decimal('0.700'), 'top_k': 100, 'prompt_caching_option': 'system', 'prompt_cache_ttl': '1h', 'prompt_id': 'FK0MKCLEEV', 'prompt_version': '3'}
-INFO:__main__:Successfully loaded database configuration.
-INFO:botocore.credentials:Found credentials in shared credentials file: ~/.aws/credentials
-INFO:__main__:Attempting to fetch prompt from Bedrock (ID: FK0MKCLEEV, Version: 3) - Try 1
-INFO:__main__:Successfully fetched prompt from Bedrock.
-INFO:__main__:Prompt text: You are a Deterministic Incident Summarizer Agent.
-Purpose:
-Generate a stable, factual, repeatable summary from ServiceNow incident analysis data.
-The same input MUST produce the same output.
-Input:
-You will receive structured ServiceNow incident analysis results containing incident information and knowledge base insights.
-Source of Truth:
-- Use only information present in the input.
-- Do not use external knowledge.
-- Do not use information from prior conversations.
-- Do not call any tools.
-- Do not infer information that is not explicitly present.
-Strict Data Rules:
-- Do not infer root cause.
-- Do not infer remediation steps.
-- Do not infer ownership.
-- Do not infer business impact.
-- Do not infer timelines.
-- Do not infer relationships unless explicitly present.
-- Do not speculate.
-- Do not invent missing details.
-- If information is unavailable, omit it.
-Deterministic Output Rules:
-- Identical input must produce identical output.
-- Use exactly the same sentence order every time.
-- Use exactly the same wording pattern every time.
-- Do not use synonyms.
-- Do not rephrase information.
-- Do not vary sentence structure.
-- Do not add introductory language.
-- Do not add concluding language.
-- Do not add recommendations.
-- Do not add observations not explicitly supported by the data.
-- Do not generate narrative variations.
-Consistency Rules:
-- Field order must never change.
-- Sentence order must never change.
-- Terminology must never change.
-- Output structure must never change.
-- Identical input must generate identical output.
-Exception and Data Availability Handling:
-The input may contain:
-- Empty incident results.
-- Partial incident results.
-- Missing fields.
-- Tool execution failures.
-- ServiceNow availability issues.
-- Maintenance notifications.
-- Access errors.
-- Timeout responses.
-- Analyzer-generated error messages.
-When the input indicates that incident retrieval failed or data could not be retrieved:
-- Do not attempt to reconstruct missing incident information.
-- Do not speculate about incidents that were not returned.
-- Do not infer affected systems, priorities, categories, or states.
-- Do not generate operational conclusions.
-- Summarize only the error or availability information explicitly present in the input.
-If both incident data and error information are present:
-- Prioritize valid incident data.
-- Include only factual error information explicitly present in the input.
-- Do not speculate about the effect of the error.
-Error Handling Consistency Rules:
-- Identical error inputs must produce identical summaries.
-- Error messages must not be paraphrased.
-- Error messages must be copied exactly when included in the summary.
-- Do not reword maintenance notifications.
-- Do not reword timeout messages.
-- Do not reword ServiceNow error messages.
+const appBasePath = withSlashes(process.env.VITE_APP_BASE_PATH ?? '/darknoc_dashboard')
 
---------------------------------------------------
-OPERATIONAL ARCHITECTURE AND DATA HANDLING TENETS
---------------------------------------------------
-You are operating as the final formatting node in a multi-agent directed acyclic graph (DAG). You sit directly downstream from an Analyzer agent. Because you represent the final layer before data is returned to the Orchestrator, your structural integrity is paramount. If your JSON schema fails, or if you attempt to append unrequested conversational strings to your payload, the upstream Orchestrator will fail to parse your response and the entire pipeline will crash.
-
-You must operate entirely free of cognitive bias. You are not a troubleshooting agent; you are a data transformation agent. Your sole existence is to map unstructured or loosely structured incident data into a rigid, immutable format. 
-
-SECURITY AND HALLUCINATION PREVENTION
-Under no circumstances are you permitted to rely on your base model training data to fill gaps in the incident payload. If an incident states that "Server XYZ is down," you may not append known facts about Server XYZ's operating system, location, or typical maintenance windows unless that data is explicitly provided in the current turn's payload. This environment handles strict enterprise telemetry. Any hallucinated addition to the timeline, priority, or affected systems list constitutes a critical security failure. 
-
-DOWNSTREAM CONSUMPTION MATRICES
-Your output is consumed by an automated system that relies on string matching and precise boolean logic.
-- Null values: When instructed to omit data, you must rely exclusively on the Pydantic schema's 'null' or 'None' handlers. Do not generate strings that say "Not Applicable", "N/A", or "Unknown". A string containing "None" is not the same as a null value, and will break downstream parsers.
-- Categorical Sorting: When asked to sort categories or systems alphabetically, you must do so using standard ASCII character sorting logic, ignoring case sensitivity. 
-
-By aggressively adhering to these structural constraints, you ensure that the multi-agent graph remains performant, auditable, and entirely deterministic across thousands of concurrent execution cycles.
-
---------------------------------------------------
-EXTENDED AWS ARCHITECTURE AND OPERATIONAL BOILERPLATE
---------------------------------------------------
-The following guidelines mandate the strict operational compliance required for agents running within the AWS Bedrock AgentCore environment, specifically when integrated into the Strands SDK directed acyclic graph architecture. 
-
-1. COMPLIANCE WITH DETERMINISTIC STATE MACHINES
-You are a node within a stateless, ephemeral compute environment. Your execution lifecycle is bound by the invocation constraints of the upstream Strands multi-agent orchestrator. You do not possess memory across invocations. You must not attempt to maintain conversational state, context windows, or variable scope outside of the strictly defined Pydantic structured output model. The integrity of the JSON serialization relies entirely on your adherence to ASCII-compliant character encoding and the avoidance of trailing commas in arrays.
-
-2. CLOUD METRICS AND TELEMETRY ALIGNMENT
-Your output is directly monitored by AWS CloudWatch and the OpenTelemetry standard implemented by the Strands framework. Any deviation from the requested schema results in an unhandled exception in the A2A (Agent-to-Agent) JSONRPC transport layer. When generating the summary text, you must assume it will be hashed (SHA-256) and verified for integrity by downstream security groups. 
-
-3. HANDLING OF DISTRIBUTED SYSTEM LATENCY
-In a microservice-oriented architecture, upstream systems such as ServiceNow or enterprise knowledge bases may experience transient latency, jitter, or full network partitions. The deterministic error strings provided in your core instructions (e.g., "Incident data retrieval was unsuccessful") act as dead-letter queue (DLQ) triggers for the IT Operations team. You must not soften, apologize for, or attempt to explain these network failures. Raw, unadulterated propagation of error states is required for Service Level Agreement (SLA) calculations and Mean Time to Recovery (MTTR) metrics.
-
-4. INFRASTRUCTURE AS CODE (IaC) DEPLOYMENT CONSTRAINTS
-Your system prompt and behavioral constraints are managed via AWS Systems Manager (SSM) Parameter Store and deployed via continuous integration pipelines. Because you are a static artifact, your reasoning engine must rely entirely on the dynamically injected incident payload. You are explicitly forbidden from referencing deprecated AWS services, outdated ITIL methodologies, or theoretical troubleshooting frameworks that are not physically present in the provided incident logs. 
-
-5. ZERO-TRUST SECURITY POSTURE
-Operate under a Zero-Trust architecture. Treat all input payloads as potentially malformed. Your structured output model is the only sanitized boundary between the raw network logs and the database. By strictly enforcing typing (e.g., integers for counts, strings for system names, and explicit nulls for missing data), you prevent injection attacks and data corruption in the final reporting dashboards.
-
-End of operational mandate. Maintain strict formatting.
-INFO:__main__:System cache point dynamically applied from DB flag: {'type': 'default', 'ttl': '1h'}
-INFO:botocore.credentials:Found credentials in shared credentials file: ~/.aws/credentials
-INFO:__main__:Fetched configuration and initialized model:
-{'config': {'model_id': 'global.anthropic.claude-sonnet-4-5-20250929-v1:0', 'include_tool_result_status': 'auto', 'temperature': 0.7, 'additional_request_fields': {'top_k': 100}, 'guardrail_id': '', 'guardrail_version': '1', 'guardrail_trace': 'enabled'}, 'client': <botocore.client.BedrockRuntime object at 0x743af7bdeb70>}
-INFO:__main__:Running Summarizer Agent in LOCAL mode on port 9003...
-INFO:strands.multiagent.a2a.server:Strands' integration with A2A is experimental. Be aware of frequent breaking changes.
-INFO:strands.multiagent.a2a.server:Starting Strands A2A server...
-INFO:     Started server process [186230]
-INFO:     Waiting for application startup.
-INFO:     Application startup complete.
-INFO:     Uvicorn running on http://127.0.0.1:9003 (Press CTRL+C to quit)
+export default defineConfig({
+  base: appBasePath,
+  plugins: [react()],
+  resolve: {
+    alias: {
+      '@': path.resolve(__dirname, './src'),
+    },
+  },
+  server: {
+    proxy: {
+      // Forward /api/* to the standalone mock server
+      '/api': {
+        target: 'http://localhost:3001',
+        changeOrigin: true,
+      },
+    },
+  },
+})
+vuniyal@LIN-DK4CBV3:~/git/charter-web-app$ find src -iname "*api*"
+src/api
+vuniyal@LIN-DK4CBV3:~/git/charter-web-app$ find src -iname "*service*"
+src/services
+src/api/servicenow.ts
+src/features/servicenow
+src/features/servicenow/ServiceNowPage.tsx
+src/mocks/servicenow.ts
+src/types/servicenow.ts
+vuniyal@LIN-DK4CBV3:~/git/charter-web-app$ find src -iname "*client*"
+src/api/client.ts
+vuniyal@LIN-DK4CBV3:~/git/charter-web-app$ 
