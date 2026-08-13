@@ -1,35 +1,30 @@
 import os
-from dotenv import load_dotenv
-from strands.models.bedrock import BedrockModel, CacheToolsConfig
 import logging
 import psycopg2
 from psycopg2.extras import DictCursor
 
-load_dotenv()
 logger = logging.getLogger(__name__)
-
-# Database configuration with your local setup as fallbacks
-DB_HOST = os.getenv("DB_HOST", "localhost")
-DB_PORT = os.getenv("DB_PORT", "5432")
-DB_NAME = os.getenv("DB_NAME", "model_config_db")
-DB_USER = os.getenv("DB_USER", "postgres")
-DB_PASSWORD = os.getenv("DB_PASSWORD", "Db@123")
-
-AWS_GUARDRAIL_IDENTIFIER = os.getenv("AWS_GUARDRAIL_IDENTIFIER", "")
 
 def fetch_db_record(query: str, params: tuple = ()) -> dict:
     """
     Generic function to fetch a single record from the database.
     Can be reused for any SQL query and table.
     """
+    # Fetch env variables dynamically when the function is called
+    db_host = os.getenv("DB_HOST", "localhost")
+    db_port = os.getenv("DB_PORT", "5432")
+    db_name = os.getenv("DB_NAME", "model_config_db")
+    db_user = os.getenv("DB_USER", "postgres")
+    db_password = os.getenv("DB_PASSWORD", "Db@123")
+
     conn = None
     try:
         conn = psycopg2.connect(
-            host=DB_HOST,
-            port=DB_PORT,
-            database=DB_NAME,
-            user=DB_USER,
-            password=DB_PASSWORD
+            host=db_host,
+            port=db_port,
+            database=db_name,
+            user=db_user,
+            password=db_password
         )
         
         cursor = conn.cursor(cursor_factory=DictCursor)
@@ -38,7 +33,7 @@ def fetch_db_record(query: str, params: tuple = ()) -> dict:
         cursor.close()
         
         if result:
-            logger.info(f"Successfully fetched DB record.")
+            logger.info("Successfully fetched DB record.")
             return dict(result)
         else:
             logger.warning("No records found for the given query.")
@@ -51,31 +46,3 @@ def fetch_db_record(query: str, params: tuple = ()) -> dict:
     finally:
         if conn is not None:
             conn.close()
-
-def load_model(db_config: dict) -> BedrockModel:
-    """
-    Instantiates the BedrockModel using passed DB configuration values. 
-    """
-    model_kwargs = {
-        "model_id": db_config.get("model_id", "global.anthropic.claude-sonnet-4-5-20250929-v1:0"),
-        "temperature": float(db_config.get("temperature", 0.20)),
-        "additional_request_fields" : {
-            "top_k": int(db_config.get("top_k", 50))
-        },
-        "guardrail_id": AWS_GUARDRAIL_IDENTIFIER,
-        "guardrail_version": "1",
-        "guardrail_trace": "enabled"
-    }
-
-    # Enable tool caching if specified in DB config
-    caching_option = db_config.get("prompt_caching_option", "none")
-    ttl_val = db_config.get("prompt_cache_ttl", "5m")
-
-    if caching_option == "system_and_tools":
-        model_kwargs["cache_tools"] = CacheToolsConfig(
-            type="default",
-            ttl=ttl_val
-        )
-        print("Tool caching dynamically enabled from config.")
-        
-    return BedrockModel(**model_kwargs)
