@@ -11,8 +11,7 @@ from strands.hooks import AfterInvocationEvent
 from strands.tools import tool
 from strands.types.content import SystemContentBlock
 
-from model.load import load_model
-from model.load import fetch_agent_config
+from model.load import load_model, fetch_db_record
 
 load_dotenv()
 AWS_REGION = os.getenv("AWS_REGION", "")
@@ -22,19 +21,67 @@ logger = logging.getLogger(__name__)
 logging.getLogger("strands.telemetry.metrics").setLevel(logging.INFO)
 
 aws_session = boto3.Session(region_name=AWS_REGION)
-ssm_client = aws_session.client('ssm')
 
-def get_ssm_parameter(param_path: str, fallback_env: str) -> str:
-    """Fetches a configuration value from AWS SSM Parameter Store with an env fallback."""
-    try:
-        response = ssm_client.get_parameter(Name=param_path, WithDecryption=False)
-        return response['Parameter']['Value']
-    except Exception as e:
-        logger.error(f"SSM path {param_path} not found or inaccessible ({e}). Falling back to environment variable.")
-        return os.getenv(fallback_env, "")
+# ========================================================
+# DATABASE QUERY & IN-MEMORY CACHING
+# ========================================================
+AGENT_CONFIG_QUERY = """
+    SELECT 
+        llm.model_id, llm.temperature, llm.top_k, 
+        llm.prompt_caching_option, llm.prompt_cache_ttl,
+        p.prompt_id, p.prompt_version
+    FROM agent_llm_config llm
+    LEFT JOIN agent_prompt_config p ON llm.agent_id = p.agent_id
+    WHERE llm.agent_name = %s;
+"""
 
-AWS_PROMPT_ID = get_ssm_parameter("/config/summarizer_agent/prompt_id", "AWS_PROMPT_ID")
-AWS_PROMPT_VERSION = get_ssm_parameter("/config/summarizer_agent/prompt_version", "AWS_PROMPT_VERSION")
+_CACHED_DB_CONFIG = None
+
+def get_cached_agent_config(agent_name: str) -> dict:
+    """
+    Fetches agent config from memory. 
+    If not initialized, executes the query using the generic DB function.
+    """
+    global _CACHED_DB_CONFIG
+    
+    if _CACHED_DB_CONFIG is not None:
+        logger.info(f"⚡ [MEMORY CACHE HIT] Using stored config for '{agent_name}'.")
+        return _CACHED_DB_CONFIG
+
+    logger.info(f"🐌 [CACHE MISS] Fetching config for '{agent_name}' from Database...")
+    
+    # Pass the query and parameters to our generic DB function
+    raw_config = fetch_db_record(query=AGENT_CONFIG_QUERY, params=(agent_name,))
+    
+    if raw_config:
+        # Map enum strings into old boolean logic expected by the agent
+        cache_option = raw_config.get('prompt_caching_option', 'none')
+        raw_config['enable_system_cache'] = cache_option in ['system', 'system_and_tools']
+        raw_config['enable_tool_cache'] = cache_option == 'system_and_tools'
+        raw_config['ttl'] = raw_config.get('prompt_cache_ttl') or '5m'
+        
+        _CACHED_DB_CONFIG = raw_config
+        logger.info(f"💾 Saved config for '{agent_name}' to application memory.")
+    else:
+        logger.warning(f"No config found in DB for '{agent_name}'. Falling back to defaults.")
+        _CACHED_DB_CONFIG = {
+            "model_id": "global.anthropic.claude-sonnet-4-5-20250929-v1:0",
+            "temperature": 0.20,
+            "top_k": 50,
+            "enable_system_cache": True,
+            "enable_tool_cache": False,
+            "prompt_id": "",
+            "prompt_version": "",
+            "ttl": "5m"
+        }
+        
+    return _CACHED_DB_CONFIG
+
+
+# Fetch DB config to get the Prompt ID & Version
+db_config_global = get_cached_agent_config("SummarizerAgent")
+AWS_PROMPT_ID = db_config_global.get("prompt_id", "")
+AWS_PROMPT_VERSION = db_config_global.get("prompt_version", "")
 
 tools = []
 bedrock_agent_client = aws_session.client('bedrock-agent')
@@ -133,37 +180,12 @@ def log_metrics_on_complete(event: AfterInvocationEvent) -> None:
     )
     logger.info(dashboard)
 
-# ========================================================
-# IN-MEMORY PYTHON CACHING MECHANISM
-# ========================================================
-_CACHED_DB_CONFIG = None
-
-def get_cached_agent_config(agent_name: str) -> dict:
-    """
-    Fetches agent config from memory. 
-    If not initialized, fetches from the DB once and stores it in a Python variable.
-    Requires restarting the process to fetch fresh DB values.
-    """
-    global _CACHED_DB_CONFIG
-    
-    # 1. Try to read from Python memory
-    if _CACHED_DB_CONFIG is not None:
-        logger.info(f"⚡ [MEMORY CACHE HIT] Using stored config for '{agent_name}'.")
-        return _CACHED_DB_CONFIG
-
-    # 2. Cache miss: Fetch from DB
-    logger.info(f"🐌 [CACHE MISS] Fetching config for '{agent_name}' from Database...")
-    _CACHED_DB_CONFIG = fetch_agent_config(agent_name=agent_name)
-    
-    logger.info(f"💾 Saved config for '{agent_name}' to application memory.")
-    return _CACHED_DB_CONFIG
-
 
 def main():
     is_local = os.getenv("ENV", "prod").lower() == "local"
 
-    # 1. Fetch DB values via the In-Memory Cache Wrapper
-    db_config = fetch_agent_config(agent_name="agent1")
+    # 1. Fetch config (will hit cache in memory since it was already fetched globally above)
+    db_config = get_cached_agent_config(agent_name="SummarizerAgent")
     TTL = db_config.get("ttl", "5m")
 
     # 2. Build system blocks and dynamically check caching flag from DB
@@ -171,14 +193,14 @@ def main():
     if db_config.get("enable_system_cache", False):
         cache_config = {"type": "default"}
 
-        if db_config.get("ttl") == "1hr":
+        if db_config.get("ttl") == "1h": 
             cache_config["ttl"] = db_config["ttl"]
 
         system_blocks.append(SystemContentBlock(cachePoint=cache_config))
         logger.info(f"System cache point dynamically applied from DB flag: {cache_config}")
     
-    # 3. Load model using DB parameters (model_id, temp, top_k, top_p)
-    MODEL_ID_DB = load_model(agent_name="agent1", db_config=db_config)
+    # 3. Load model passing the direct config
+    MODEL_ID_DB = load_model(db_config=db_config)
     logger.info("Fetched configuration and initialized model:")
     print(vars(MODEL_ID_DB))
     
