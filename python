@@ -1,5 +1,8 @@
-vuniyal@LIN-DK4CBV3:~/git/base_agent$ uv build
-Building source distribution (uv build backend)...
-Building wheel from source distribution (uv build backend)...
-Successfully built dist/base_agent-0.1.0.tar.gz
-Successfully built dist/base_agent-0.1.0-py3-none-any.whl
+# 1. Go back to your agent directory
+cd ~/git/summarizeragent_agent/app/agent
+
+# 2. Add the newly built wheel file (using the absolute path to make it easy)
+uv add ~/git/base_agent/dist/base_agent-0.1.0-py3-none-any.whl
+
+# 3. Start your agent!
+uv run main.py
