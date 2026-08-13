@@ -1,98 +1,21 @@
-vuniyal@LIN-DK4CBV3:~/git/charter-web-app$ grep -R "axios" src
-src/api/prompts.ts:import axios from 'axios'
-src/api/prompts.ts:const promptApiClient = axios.create({
-src/api/prompts.ts:  if (axios.isAxiosError(error)) {
-src/api/client.ts:import axios from 'axios'
-src/api/client.ts:export const apiClient = axios.create({
-src/features/agent-config/AgentConfigPage.tsx:import axios from 'axios'
-src/features/agent-config/AgentConfigPage.tsx:  if (axios.isAxiosError(error)) {
-vuniyal@LIN-DK4CBV3:~/git/charter-web-app$ grep -R "fetch(" src
-src/api/hostAgentPrivilege.ts:  const res = await fetch(`${SNOW_BASE}/agent/privileges`);
-src/api/hostAgentPrivilege.ts:  const res = await fetch(`${SNOW_BASE}/agent/privileges/update`, {
-src/api/chat.ts:  const res = await fetch(`${BASE_URL}/chat`, {
-src/api/chat.ts:  const res = await fetch(`${BASE_URL}/chat`, {
-src/api/servicenow.ts:  const res = await fetch(`${SNOW_BASE}/servicenow/incidents/${incidentId}/work_notes`, {
-src/api/servicenow.ts:  const res = await fetch(`${SNOW_BASE}/servicenow/incidents?${searchParams.toString()}`);
-src/api/servicenow.ts:  const res = await fetch(`${SNOW_BASE}/servicenow/incidents/${id}`);
-src/api/servicenow.ts:  const res = await fetch(`${SNOW_BASE}/servicenow/incidents/${incidentId}/work_notes`);
-src/features/otel-test/OtelDataPublishPage.tsx:  await fetch(TOPOLOGY_HEALTH_URL(device), {
-src/features/otel-test/OtelDataPublishPage.tsx:      const response = await fetch(OTEL_DATA_URL, {
-src/features/prompt-management/PromptListPage.tsx:          <Button variant="outline" onClick={() => query.refetch()}>
-src/features/prompt-management/PromptVersionsTab.tsx:          <Button variant="outline" size="sm" onClick={() => versionsQuery.refetch()}>
-vuniyal@LIN-DK4CBV3:~/git/charter-web-app$ grep -R "topology/nodes" src
-src/api/digitalTwin.ts: *   GET  /api/topology/nodes/health
-src/api/digitalTwin.ts: *   GET  /api/topology/nodes/:nodeId/health
-src/api/digitalTwin.ts: *   PUT  /api/topology/nodes/:nodeId/health      { status, actor? }
-src/api/digitalTwin.ts: *   POST /api/topology/nodes/:nodeId/health/toggle  { actor? }
-src/api/digitalTwin.ts: *   POST /api/topology/nodes/health/reset        { status, actor? }
-src/api/digitalTwin.ts:// ── GET /api/topology/nodes/:nodeId/health ─────────────────────────────────
-src/api/digitalTwin.ts:    `/topology/nodes/${encodeURIComponent(nodeId)}/health`,
-src/api/digitalTwin.ts:// ── PUT /api/topology/nodes/:nodeId/health ─────────────────────────────────
-src/api/digitalTwin.ts:    `/topology/nodes/${encodeURIComponent(nodeId)}/health`,
-src/api/digitalTwin.ts:// ── POST /api/topology/nodes/:nodeId/health/toggle ─────────────────────────
-src/api/digitalTwin.ts:    `/topology/nodes/${encodeURIComponent(nodeId)}/health/toggle`,
-src/api/digitalTwin.ts:// ── GET /api/topology/nodes/health ─────────────────────────────────────────
-src/api/digitalTwin.ts:  const { data } = await apiClient.get<NodeHealthEntry[]>('/topology/nodes/health')
-src/api/digitalTwin.ts:// ── POST /api/topology/nodes/health/reset ──────────────────────────────────
-src/api/digitalTwin.ts:    '/topology/nodes/health/reset',
-src/features/otel-test/OtelDataPublishPage.tsx:  `${import.meta.env.VITE_TOPOLOGY_MOCK_URL ?? 'http://darknoc.capgemini.com:3001'}/api/topology/nodes/${encodeURIComponent(device)}/health`
-src/mocks/handlers/topologyHealth.ts: *   GET  /api/topology/nodes/health
-src/mocks/handlers/topologyHealth.ts: *   GET  /api/topology/nodes/:nodeId/health
-src/mocks/handlers/topologyHealth.ts: *   PUT  /api/topology/nodes/:nodeId/health      { status, actor? }
-src/mocks/handlers/topologyHealth.ts: *   POST /api/topology/nodes/:nodeId/health/toggle  { actor? }
-src/mocks/handlers/topologyHealth.ts: *   POST /api/topology/nodes/health/reset        { status, actor? }
-src/mocks/handlers/topologyHealth.ts:const BASE = '/api/topology/nodes'
-src/mocks/handlers/topologyHealth.ts:// ── GET /api/topology/nodes/health ─────────────────────────────────────────
-src/mocks/handlers/topologyHealth.ts:// ── GET /api/topology/nodes/:nodeId/health ─────────────────────────────────
-src/mocks/handlers/topologyHealth.ts:// ── PUT /api/topology/nodes/:nodeId/health ─────────────────────────────────
-src/mocks/handlers/topologyHealth.ts:// ── POST /api/topology/nodes/:nodeId/health/toggle ─────────────────────────
-src/mocks/handlers/topologyHealth.ts:// ── POST /api/topology/nodes/health/reset ──────────────────────────────────
-vuniyal@LIN-DK4CBV3:~/git/charter-web-app$ grep -R "baseURL" src
-src/api/prompts.ts:  baseURL: PROMPT_MANAGEMENT_BACKEND_URL,
-src/api/client.ts:  baseURL: (
-vuniyal@LIN-DK4CBV3:~/git/charter-web-app$ grep -R "baseURL" src
-src/api/prompts.ts:  baseURL: PROMPT_MANAGEMENT_BACKEND_URL,
-src/api/client.ts:  baseURL: (
-vuniyal@LIN-DK4CBV3:~/git/charter-web-app$ cat vite.config.*
-import path from 'path'
-import { defineConfig } from 'vite'
-import react from '@vitejs/plugin-react'
+FROM node:20-alpine AS deps
+WORKDIR /app
 
-function withSlashes(basePath: string) {
-  const trimmed = basePath.trim()
-  const withLeading = trimmed.startsWith('/') ? trimmed : `/${trimmed}`
-  return withLeading.endsWith('/') ? withLeading : `${withLeading}/`
-}
+COPY package*.json ./
+RUN npm ci
 
-const appBasePath = withSlashes(process.env.VITE_APP_BASE_PATH ?? '/darknoc_dashboard')
+FROM deps AS build
+COPY . .
+RUN npm run build
 
-export default defineConfig({
-  base: appBasePath,
-  plugins: [react()],
-  resolve: {
-    alias: {
-      '@': path.resolve(__dirname, './src'),
-    },
-  },
-  server: {
-    proxy: {
-      // Forward /api/* to the standalone mock server
-      '/api': {
-        target: 'http://localhost:3001',
-        changeOrigin: true,
-      },
-    },
-  },
-})
-vuniyal@LIN-DK4CBV3:~/git/charter-web-app$ find src -iname "*api*"
-src/api
-vuniyal@LIN-DK4CBV3:~/git/charter-web-app$ find src -iname "*service*"
-src/services
-src/api/servicenow.ts
-src/features/servicenow
-src/features/servicenow/ServiceNowPage.tsx
-src/mocks/servicenow.ts
-src/types/servicenow.ts
-vuniyal@LIN-DK4CBV3:~/git/charter-web-app$ find src -iname "*client*"
-src/api/client.ts
-vuniyal@LIN-DK4CBV3:~/git/charter-web-app$ 
+FROM nginx:1.27-alpine AS frontend
+COPY docker/nginx.conf /etc/nginx/conf.d/default.conf
+RUN mkdir -p /usr/share/nginx/html/darknoc_dashboard
+COPY --from=build /app/dist /usr/share/nginx/html/darknoc_dashboard
+EXPOSE 80
+CMD ["nginx", "-g", "daemon off;"]
+
+FROM deps AS mock
+COPY mock-server.mjs ./mock-server.mjs
+EXPOSE 3001
+CMD ["node", "mock-server.mjs"]
