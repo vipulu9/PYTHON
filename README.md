@@ -1,80 +1,43 @@
-import os
-from dotenv import load_dotenv
-from strands.models.bedrock import BedrockModel, CacheToolsConfig
-import logging
-import psycopg2
-from psycopg2.extras import DictCursor
+The provisioning plan for **dnn_provisioning** is ready for review.
 
-load_dotenv()
-logger = logging.getLogger(__name__)
+**Service parameters:**
+  • detected_ip_modes: ['static_pool']
+  • ipAllocationMode: static_pool
+  • scenario: static
+  • radius: shared
+  • account: testing
+  • dnn_name: testing
+  • servicename: testing
+  • customer_address: testing
+  • epg1: epg1-id
+  • smf1: smf1-id
+  • operation: create
+  • servicetype: mpn::dnn
+  • has_lpgs: False
+  • has_epg2: False
+  • dnn_snssai: 1-000100
+  • slice_size: 1
+  • static_ip_pool: static-ip-pool-testing
+  • pdp_creation: unblocked
+  • configure_PEs_SB: True
+  • dnn_pcc_rule_activate: False
+  • radius_server: radius_b2b
+  • dnn_n7_profile: n7-1
+  • dnn_n40_profile: n40-1
+  • dnn_rule_space_default: rule-space-default
+  • dnn_policy_control: rule-space-default
+  • auth_legacy_user_info: True
+  • dnn_network_instance: testing-network-instance
+  • dnn_ip_condition: condition-testing
+  • dnn_upf_condition: testing-upf-condition
+  • dnn_local_rule_space_default: local-rule-space-default-testing
+  • dnn_pcc_rule: pcc-rule-block-ue2ue-testing
 
-# Database configuration with your local setup as fallbacks
-DB_HOST = os.getenv("DB_HOST", "localhost")
-DB_PORT = os.getenv("DB_PORT", "5432")
-DB_NAME = os.getenv("DB_NAME", "model_config_db")
-DB_USER = os.getenv("DB_USER", "postgres")
-DB_PASSWORD = os.getenv("DB_PASSWORD", "Db@123")
+**Resolved infrastructure resources:**
+  • smf: smf1-id
+  • epg: epg1-id
+  • lpg: lpg1-id
+  • epg1: epg1-id
+  • smf1: smf1-id
 
-AWS_GUARDRAIL_IDENTIFIER = os.getenv("AWS_GUARDRAIL_IDENTIFIER", "")
-
-def fetch_db_record(query: str, params: tuple = ()) -> dict:
-    """
-    Generic function to fetch a single record from the database.
-    Can be reused for any SQL query and table.
-    """
-    conn = None
-    try:
-        conn = psycopg2.connect(
-            host=DB_HOST,
-            port=DB_PORT,
-            database=DB_NAME,
-            user=DB_USER,
-            password=DB_PASSWORD
-        )
-        
-        cursor = conn.cursor(cursor_factory=DictCursor)
-        cursor.execute(query, params)
-        result = cursor.fetchone()
-        cursor.close()
-        
-        if result:
-            logger.info(f"Successfully fetched DB record.")
-            return dict(result)
-        else:
-            logger.warning("No records found for the given query.")
-            return {}
-
-    except psycopg2.Error as e:
-        logger.error(f"Database error while executing query: {e}")
-        return {}
-        
-    finally:
-        if conn is not None:
-            conn.close()
-
-def load_model(db_config: dict) -> BedrockModel:
-    """
-    Instantiates the BedrockModel using passed DB configuration values. 
-    """
-    model_kwargs = {
-        "model_id": db_config.get("model_id", "global.anthropic.claude-sonnet-4-5-20250929-v1:0"),
-        "temperature": float(db_config.get("temperature", 0.20)),
-        "additional_request_fields" : {
-            "top_k": int(db_config.get("top_k", 50))
-        },
-        "guardrail_id": AWS_GUARDRAIL_IDENTIFIER,
-        "guardrail_version": "1",
-        "guardrail_trace": "enabled"
-    }
-    
-    # Enable tool caching if specified in DB config
-    TTL = db_config.get("ttl", "5m")
-
-    if db_config.get("enable_tool_cache"):
-        model_kwargs["cache_tools"] = CacheToolsConfig(
-            type="default",
-            ttl=TTL
-        )
-        print("Tool caching dynamically enabled from config.")
-        
-    return BedrockModel(**model_kwargs)
+Reply **approve** to proceed with execution, or **reject** to cancel. You can also send a JSON object with field updates, for example: {"config_payload": {"dnn_name": "new-name"}}.
