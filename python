@@ -1,91 +1,92 @@
-import { AssistantMessage } from "@/components/chat/messages/AssistantMessage";
-import {
-  A2UIDynamicFormMessageView,
-  NotificationMessageView,
-  StatusCardMessageView,
-  TableMessageView,
-  WorkflowProgressMessageView
-} from "@/components/chat/messages/FutureMessages";
-import { FormMessage } from "@/components/chat/messages/FormMessage";
-import { SystemMessage } from "@/components/chat/messages/SystemMessage";
-import { UserMessage } from "@/components/chat/messages/UserMessage";
-import type { ProvisioningFormValues } from "@/types/forms";
-import type {
-  A2UIDynamicFormMessage,
-  ChatMessage,
-  FormMessage as FormMessageType
-} from "@/types/message";
+Analyze the current Modify mode implementation of the Final Review payload before making any changes.
 
-export interface ReviewEditableProperty {
-  type: "string" | "number" | "integer" | "boolean" | "array" | "object";
-  label: string;
-  description?: string;
-  enum?: string[];
-  readOnly?: boolean;
-  hidden?: boolean;
-}
+Background:
+- The Final Review screen displays a read-only payload summary.
+- Clicking Modify converts the payload into an editable dynamic form.
+- The current implementation allows editing too many fields.
+- I need field-level rules so certain fields are hidden or read-only during Modify mode.
 
-export interface ReviewEditableConfig {
-  values: Record<string, unknown>;
-  required: string[];
-  properties: Record<string, ReviewEditableProperty>;
-}
+Requirement:
 
-interface MessageRendererProps {
-  message: ChatMessage;
-  onFormSubmit: (
-    message: FormMessageType,
-    values: ProvisioningFormValues
-  ) => void;
-  onA2UIFormSubmit: (message: A2UIDynamicFormMessage, values: Record<string, unknown>) => void;
-  onSendMessage?: (content: string) => void;
-  reviewEditableConfig?: ReviewEditableConfig;
-}
+Rule 1: Hidden Fields
+The following fields should NOT be shown at all in Modify mode:
 
-export function MessageRenderer({
-  message,
-  onFormSubmit,
-  onA2UIFormSubmit,
-  onSendMessage,
-  reviewEditableConfig
-}: MessageRendererProps) {
-  if (message.kind === "form") {
-    return <FormMessage message={message} onSubmit={onFormSubmit} />;
-  }
+- operation
+- detected_ip_modes
+- ipAllocationMode
 
-  if (message.kind === "status-card") {
-    return <StatusCardMessageView message={message} />;
-  }
+Expected Behavior:
+- These fields should continue to appear in the read-only Final Review message.
+- These fields should NOT appear in the editable dynamic form.
+- Users should not be able to view or modify them during editing.
+- Their values should be preserved internally and continue to be submitted as before.
 
-  if (message.kind === "notification") {
-    return <NotificationMessageView message={message} />;
-  }
+Rule 2: Read-Only Fields
+The following fields should appear in Modify mode but must be read-only:
 
-  if (message.kind === "table") {
-    return <TableMessageView message={message} />;
-  }
+- scenario
+- radius
+- account
+- customer_address
+- dnn_name
+- servicename
+- epg1
+- smf1
 
-  if (message.kind === "a2ui-form") {
-    return <A2UIDynamicFormMessageView message={message} onSubmit={onA2UIFormSubmit} />;
-  }
+Expected Behavior:
+- Display these fields in the editable form.
+- Users should be able to see their values.
+- Users must NOT be able to modify them.
+- Use the existing form's read-only/disabled field mechanism if available.
 
-  if (message.kind === "workflow-progress") {
-    return <WorkflowProgressMessageView message={message} />;
-  }
+Future-Proofing Requirement:
+- Do not hardcode this logic directly into the rendering component.
+- Implement the solution in a configuration-driven or metadata-driven manner consistent with the existing architecture.
+- It should be easy to add more fields later to:
+  - Hidden Fields list
+  - Read-Only Fields list
+without requiring major code changes.
 
-  if (message.role === "user") {
-    return <UserMessage message={message} />;
-  }
+Example:
 
-  if (message.role === "system") {
-    return <SystemMessage message={message} />;
-  }
+Hidden Fields:
+[
+  "operation",
+  "detected_ip_modes",
+  "ipAllocationMode"
+]
 
-  return (
-    <AssistantMessage
-      message={message}
-      onSendMessage={onSendMessage}
-      reviewEditableConfig={reviewEditableConfig}
-    />
-  );
-}
+ReadOnly Fields:
+[
+  "scenario",
+  "radius",
+  "account",
+  "customer_address",
+  "dnn_name",
+  "servicename",
+  "epg1",
+  "smf1"
+]
+
+Constraints:
+- Make only the minimal changes required.
+- Do not change application architecture.
+- Do not modify backend APIs.
+- Do not modify payload generation logic.
+- Do not modify workflow functionality.
+- Do not change database schema.
+- Preserve existing Approve, Reject, Modify, and Done behavior.
+- Reuse existing A2UI rendering patterns.
+
+Before implementation:
+1. Explain where the Modify-mode form is generated.
+2. Explain the best place to apply field visibility/editability rules.
+3. Describe the minimal implementation approach.
+
+After implementation:
+1. List all modified files.
+2. Explain the changes made in each file.
+3. Confirm that hidden fields remain visible in the original Final Review message but not in Modify mode.
+4. Confirm that read-only fields are visible but not editable in Modify mode.
+5. Confirm that all field values are still preserved and submitted correctly.
+6. Confirm that additional hidden/read-only fields can easily be added in the future.
