@@ -1,525 +1,269 @@
-import { Bot, CheckCircle2, FileJson2, PencilLine, XCircle } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useRef } from "react";
 
+import { MessageRenderer } from "@/components/chat/MessageRenderer";
 import type { ReviewEditableConfig } from "@/components/chat/MessageRenderer";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { Select } from "@/components/ui/select";
-import { Textarea } from "@/components/ui/textarea";
-import type { TextMessage } from "@/types/message";
+import type { CatalogItemId } from "@/types/catalog";
+import {
+  createDnnParameters,
+  getCreateDnnRequiredFields,
+  provisioningFormDefinitions,
+  type CreateDnnFormValues
+} from "@/types/forms";
+import type { ProvisioningFormValues } from "@/types/forms";
+import type { A2UIDynamicFormMessage, ChatMessage, FormMessage } from "@/types/message";
 
-interface AssistantMessageProps {
-  message: TextMessage;
+interface MessageListProps {
+  messages: ChatMessage[];
+  onFormSubmit: (message: FormMessage, values: ProvisioningFormValues) => void;
+  onA2UIFormSubmit: (message: A2UIDynamicFormMessage, values: Record<string, unknown>) => void;
   onSendMessage?: (content: string) => void;
-  reviewEditableConfig?: ReviewEditableConfig;
 }
 
-interface EditableField {
-  id: string;
-  key: string;
-  label: string;
-  type: "string" | "number" | "integer" | "boolean" | "array" | "object";
-  value: unknown;
-  lineIndex?: number;
-  linePrefix?: string;
-  enum?: string[];
-  readOnly?: boolean;
-  description?: string;
-  quoted?: boolean;
-  trailingComma?: boolean;
-}
+const REVIEW_HIDDEN_FIELDS = ["operation", "detected_ip_modes", "ipAllocationMode"];
+const REVIEW_READ_ONLY_FIELDS = [
+  "scenario",
+  "radius",
+  "account",
+  "customer_address",
+  "dnn_name",
+  "servicename",
+  "epg1",
+  "smf1"
+];
 
-type ReviewToken =
-  | {
-      kind: "line";
-      id: string;
-      content: string;
-    }
-  | {
-      kind: "section";
-      id: string;
-      title: string;
-    }
-  | {
-      kind: "field";
-      field: EditableField;
-    };
-
-function normalizeFieldKey(value: string): string {
+function normalizeReviewFieldKey(value: string): string {
   return value.toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
-function inferFieldTypeFromString(value: string): EditableField["type"] {
-  const normalized = value.trim().toLowerCase();
-  if (normalized === "true" || normalized === "false" || normalized === "yes" || normalized === "no") {
+const hiddenFieldLookup = new Set(REVIEW_HIDDEN_FIELDS.map(normalizeReviewFieldKey));
+const readOnlyFieldLookup = new Set(REVIEW_READ_ONLY_FIELDS.map(normalizeReviewFieldKey));
+
+function inferValueType(value: unknown): "string" | "number" | "integer" | "boolean" | "array" | "object" {
+  if (typeof value === "boolean") {
     return "boolean";
   }
 
-  if (/^-?\d+$/.test(normalized)) {
-    return "integer";
+  if (typeof value === "number") {
+    return Number.isInteger(value) ? "integer" : "number";
   }
 
-  if (/^-?\d+\.\d+$/.test(normalized)) {
-    return "number";
-  }
-
-  if (value.includes(",")) {
+  if (Array.isArray(value)) {
     return "array";
+  }
+
+  if (value && typeof value === "object") {
+    return "object";
   }
 
   return "string";
 }
 
-function parseFieldValue(raw: string, type: EditableField["type"]): unknown {
-  const trimmed = raw.trim().replace(/,$/, "");
+function applyReviewFieldAccessRules(config: ReviewEditableConfig): ReviewEditableConfig {
+  const nextProperties = Object.entries(config.properties).reduce<ReviewEditableConfig["properties"]>((acc, [key, property]) => {
+    const normalizedKey = normalizeReviewFieldKey(key);
 
-  if (type === "boolean") {
-    const normalized = trimmed.toLowerCase();
-    return normalized === "true" || normalized === "yes";
-  }
+    acc[key] = {
+      ...property,
+      hidden: hiddenFieldLookup.has(normalizedKey),
+      readOnly: property.readOnly === true || readOnlyFieldLookup.has(normalizedKey)
+    };
 
-  if (type === "integer" || type === "number") {
-    const parsed = Number(trimmed);
-    return Number.isNaN(parsed) ? undefined : parsed;
-  }
-
-  if (type === "array") {
-    return trimmed
-      .split(",")
-      .map((item) => item.trim())
-      .filter(Boolean);
-  }
-
-  return raw;
-}
-
-function formatFieldValue(value: unknown, type: EditableField["type"]): string {
-  if (value === null || value === undefined) {
-    return "";
-  }
-
-  if (type === "boolean") {
-    return value ? "true" : "false";
-  }
-
-  if (type === "array") {
-    return Array.isArray(value) ? value.join(", ") : String(value);
-  }
-
-  if (type === "object") {
-    try {
-      return JSON.stringify(value);
-    } catch {
-      return String(value);
-    }
-  }
-
-  return String(value);
-}
-
-function parseRawValueFormatting(raw: string): {
-  coreValue: string;
-  quoted: boolean;
-  trailingComma: boolean;
-} {
-  const trimmed = raw.trim();
-  const trailingComma = trimmed.endsWith(",");
-  const withoutComma = trailingComma ? trimmed.slice(0, -1).trimEnd() : trimmed;
-  const quoted =
-    withoutComma.length >= 2 &&
-    withoutComma.startsWith('"') &&
-    withoutComma.endsWith('"');
-  const coreValue = quoted ? withoutComma.slice(1, -1) : withoutComma;
+    return acc;
+  }, {});
 
   return {
-    coreValue,
-    quoted,
-    trailingComma
+    ...config,
+    properties: nextProperties
   };
 }
 
-function formatFieldValueForLine(field: EditableField, value: unknown): string {
-  const base = formatFieldValue(value, field.type);
-  const withQuotes = field.quoted && field.type === "string" ? `"${base}"` : base;
-  return field.trailingComma ? `${withQuotes},` : withQuotes;
-}
-
-function parseLineEditableFields(
-  content: string,
-  reviewEditableConfig?: ReviewEditableConfig
-): ReviewToken[] {
-  const lines = content.split("\n");
-  const schemaProperties = reviewEditableConfig?.properties ?? {};
-  const schemaEntries = Object.entries(schemaProperties);
-  const schemaLookup = new Map<
-    string,
-    { propertyName: string; property: ReviewEditableConfig["properties"][string] }
-  >();
-
-  for (const [propertyName, property] of schemaEntries) {
-    schemaLookup.set(normalizeFieldKey(propertyName), { propertyName, property });
-    schemaLookup.set(normalizeFieldKey(property.label), { propertyName, property });
-  }
-
-  const tokens: ReviewToken[] = [];
-
-  lines.forEach((line, lineIndex) => {
-    const trimmed = line.trim();
-    if (!trimmed) {
-      tokens.push({ kind: "line", id: `line-${lineIndex}`, content: line });
-      return;
-    }
-
-    // Only bullet-prefixed key-value lines are editable (e.g., "• key: value").
-    const match = line.match(/^(\s*(?:[-*•]\s+))([^:\n][^:]*)\s*:\s*(.*)$/);
-    if (!match) {
-      tokens.push({ kind: "line", id: `line-${lineIndex}`, content: line });
-      return;
-    }
-
-    const linePrefix = match[1] ?? "";
-    const key = match[2].trim();
-    const rawValue = match[3] ?? "";
-    if (rawValue.trim().length === 0) {
-      tokens.push({
-        kind: "section",
-        id: `section-${lineIndex}`,
-        title: key
-      });
-      return;
-    }
-
-    const valueFormatting = parseRawValueFormatting(rawValue);
-    const schemaMatch = schemaLookup.get(normalizeFieldKey(key));
-    if (schemaMatch?.property.hidden === true) {
-      return;
-    }
-
-    const schemaType = schemaMatch?.property.type;
-    const inferredType = inferFieldTypeFromString(rawValue);
-    const type =
-      schemaType === "boolean" ||
-      schemaType === "number" ||
-      schemaType === "integer" ||
-      schemaType === "array" ||
-      schemaType === "object"
-        ? schemaType
-        : inferredType;
-
-    tokens.push({
-      kind: "field",
-      field: {
-        id: `${lineIndex}:${key}`,
-        key,
-        label: schemaMatch?.property.label ?? key,
-        type,
-        value: parseFieldValue(valueFormatting.coreValue, type),
-        lineIndex,
-        linePrefix,
-        enum: schemaMatch?.property.enum,
-        readOnly: schemaMatch?.property.readOnly,
-        description: schemaMatch?.property.description,
-        quoted: valueFormatting.quoted,
-        trailingComma: valueFormatting.trailingComma
-      }
-    });
-  });
-
-  const parsedFields = tokens.filter((token): token is { kind: "field"; field: EditableField } => token.kind === "field");
-
-  if (parsedFields.length > 0) {
-    return tokens;
-  }
-
-  return schemaEntries
-    .filter(([, property]) => property.hidden !== true)
-    .map(([name, property], index) => ({
-      kind: "field",
-      field: {
-        id: name,
-        key: name,
-        label: property.label,
-        type: property.type,
-        value: reviewEditableConfig?.values[name],
-        enum: property.enum,
-        readOnly: property.readOnly,
-        description: property.description,
-        lineIndex: index,
-        linePrefix: ""
-      }
-    }));
-}
-
-function applyDraftValuesToContent(
-  content: string,
-  fields: EditableField[],
-  draftValues: Record<string, unknown>
-): string {
-  const nextLines = content.split("\n");
-
-  fields.forEach((field) => {
-    if (field.lineIndex === undefined || field.readOnly) {
-      return;
-    }
-
-    const linePrefix = field.linePrefix ?? "";
-    const value = field.id in draftValues ? draftValues[field.id] : field.value;
-    nextLines[field.lineIndex] = `${linePrefix}${field.key}: ${formatFieldValueForLine(field, value)}`;
-  });
-
-  return nextLines.join("\n");
-}
-
-export function AssistantMessage({
-  message,
-  onSendMessage,
-  reviewEditableConfig
-}: AssistantMessageProps) {
-  const isWideLayout = message.metadata?.layout === "wide";
-  const requiresApproval = message.metadata?.requiresApproval === true;
-  const [decision, setDecision] = useState<"approved" | "rejected" | null>(null);
-  const [isEditing, setIsEditing] = useState(false);
-  const [reviewContent, setReviewContent] = useState(message.content);
-  const reviewTokens = useMemo(
-    () => parseLineEditableFields(reviewContent, reviewEditableConfig),
-    [reviewContent, reviewEditableConfig]
-  );
-  const editableFields = useMemo(
-    () => reviewTokens.filter((token): token is { kind: "field"; field: EditableField } => token.kind === "field").map((token) => token.field),
-    [reviewTokens]
-  );
-  const [draftValues, setDraftValues] = useState<Record<string, unknown>>({});
-
-  useEffect(() => {
-    setReviewContent(message.content);
-    setDraftValues({});
-    setIsEditing(false);
-  }, [message.id]);
-
-  const hasStructuredEditor = requiresApproval && editableFields.length > 0;
-
-  const updateEditableValue = (name: string, value: unknown) => {
-    setDraftValues((current) => ({ ...current, [name]: value }));
+function buildFromA2UI(message: A2UIDynamicFormMessage): ReviewEditableConfig | null {
+  const schema = message.schema as {
+    required?: string[];
+    properties?: Record<string, {
+      type?: string;
+      title?: string;
+      description?: string;
+      enum?: string[];
+      readOnly?: boolean;
+    }>;
   };
+  const values = message.data;
 
-  function handleApprove() {
-    setDecision("approved");
-    onSendMessage?.("approve");
+  if (!values || typeof values !== "object") {
+    return null;
   }
 
-  function handleReject() {
-    setDecision("rejected");
-    onSendMessage?.("reject");
+  const properties = schema.properties ?? {};
+  const configuredFields = Object.keys(properties);
+  const valueFields = Object.keys(values);
+  const allFields = Array.from(new Set([...configuredFields, ...valueFields]));
+
+  const mappedProperties = allFields.reduce<ReviewEditableConfig["properties"]>((acc, key) => {
+    const def = properties[key];
+    const valueType = inferValueType(values[key]);
+    const schemaType = def?.type;
+
+    acc[key] = {
+      type:
+        schemaType === "boolean" ||
+        schemaType === "number" ||
+        schemaType === "integer" ||
+        schemaType === "array"
+          ? schemaType
+          : schemaType === "object"
+            ? "object"
+            : valueType,
+      label: def?.title ?? key,
+      description: def?.description,
+      enum: Array.isArray(def?.enum) ? def?.enum : undefined,
+      readOnly: def?.readOnly === true
+    };
+
+    return acc;
+  }, {});
+
+  return {
+    values,
+    required: schema.required ?? [],
+    properties: mappedProperties
+  };
+}
+
+function buildFromCatalogSubmission(message: ChatMessage): ReviewEditableConfig | null {
+  if (message.kind !== "text" || message.role !== "user") {
+    return null;
   }
 
-  function handleModify() {
-    if (!hasStructuredEditor) {
-      return;
-    }
+  if (message.metadata?.source !== "catalog-form") {
+    return null;
+  }
 
-    const nextDraftValues = editableFields.reduce<Record<string, unknown>>((acc, field) => {
-      acc[field.id] = field.value;
+  const payload = message.structuredData;
+  if (!payload || typeof payload !== "object") {
+    return null;
+  }
+
+  const catalogIdRaw = payload.catalogId;
+  const valuesRaw = payload.values;
+
+  if (
+    (catalogIdRaw !== "create-dnn" && catalogIdRaw !== "modify-dnn" && catalogIdRaw !== "delete-dnn") ||
+    !valuesRaw ||
+    typeof valuesRaw !== "object"
+  ) {
+    return null;
+  }
+
+  const catalogId = catalogIdRaw as CatalogItemId;
+  const values = valuesRaw as Record<string, unknown>;
+  const valueKeys = Object.keys(values);
+
+  if (catalogId === "create-dnn") {
+    const definitionByName = new Map(createDnnParameters.map((field) => [field.name, field]));
+    const requiredSet = new Set(getCreateDnnRequiredFields(values as CreateDnnFormValues));
+
+    const properties = valueKeys.reduce<ReviewEditableConfig["properties"]>((acc, key) => {
+      const def = definitionByName.get(key);
+      acc[key] = {
+        type: def?.type ?? inferValueType(values[key]),
+        label: key,
+        description: def?.description,
+        enum: def?.enum
+      };
       return acc;
     }, {});
 
-    setDraftValues(nextDraftValues);
-    setIsEditing(true);
+    return {
+      values,
+      required: valueKeys.filter((key) => requiredSet.has(key)),
+      properties
+    };
   }
 
-  function handleDoneEditing() {
-    if (hasStructuredEditor) {
-      setReviewContent((current) => applyDraftValuesToContent(current, editableFields, draftValues));
+  const definition = provisioningFormDefinitions[catalogId];
+  const formFieldMap = new Map(definition.fields.map((field) => [field.name, field]));
+
+  const properties = valueKeys.reduce<ReviewEditableConfig["properties"]>((acc, key) => {
+    const field = formFieldMap.get(key);
+    let type = inferValueType(values[key]);
+
+    if (field?.type === "select") {
+      type = "string";
     }
-    setIsEditing(false);
+
+    acc[key] = {
+      type,
+      label: field?.label ?? key,
+      description: field?.placeholder,
+      enum: field?.options?.map((option) => option.value)
+    };
+    return acc;
+  }, {});
+
+  return {
+    values,
+    required: definition.fields.filter((field) => field.required).map((field) => field.name),
+    properties
+  };
+}
+
+function getReviewEditableConfig(messages: ChatMessage[], currentIndex: number): ReviewEditableConfig | undefined {
+  for (let index = currentIndex - 1; index >= 0; index -= 1) {
+    const candidate = messages[index];
+
+    if (candidate.kind === "a2ui-form" && candidate.metadata?.status === "submitted") {
+      const fromA2UI = buildFromA2UI(candidate);
+      if (fromA2UI) {
+        return applyReviewFieldAccessRules(fromA2UI);
+      }
+    }
+
+    const fromCatalog = buildFromCatalogSubmission(candidate);
+    if (fromCatalog) {
+      return applyReviewFieldAccessRules(fromCatalog);
+    }
   }
 
-  const content = (
-    <>
-      {!isEditing ? (
-        <p className="whitespace-pre-wrap break-words [overflow-wrap:anywhere]">
-          {reviewContent}
-        </p>
-      ) : (
-        <div className="space-y-4">
-          <div className="flex items-center gap-2 text-xs text-muted-foreground">
-            <FileJson2 className="h-4 w-4 text-primary" />
-            <span>Update values only. Field names and section structure are fixed.</span>
-          </div>
-          <form className="space-y-4" onSubmit={(event) => event.preventDefault()}>
-            {reviewTokens.map((token) => {
-              if (token.kind === "line") {
-                return token.content.trim().length > 0 ? (
-                  <p key={token.id} className="text-sm text-muted-foreground">
-                    {token.content.trim()}
-                  </p>
-                ) : (
-                  <div key={token.id} className="h-1" />
-                );
-              }
+  return undefined;
+}
 
-              if (token.kind === "section") {
-                return (
-                  <p key={token.id} className="pt-2 text-sm font-semibold text-foreground">
-                    {token.title}
-                  </p>
-                );
-              }
+export function MessageList({
+  messages,
+  onFormSubmit,
+  onA2UIFormSubmit,
+  onSendMessage
+}: MessageListProps) {
+  const endRef = useRef<HTMLDivElement | null>(null);
 
-              const field = token.field;
-              const canEdit = field.readOnly !== true;
-              const value = field.id in draftValues ? draftValues[field.id] : field.value;
-
-              return (
-                <div key={field.id} className="space-y-2">
-                  <Label htmlFor={`review-${message.id}-${field.id}`}>
-                    {field.label}
-                  </Label>
-
-                  {canEdit && field.enum?.length ? (
-                    <Select
-                      id={`review-${message.id}-${field.id}`}
-                      value={typeof value === "string" ? value : ""}
-                      onChange={(event) => updateEditableValue(field.id, event.target.value)}
-                    >
-                      <option value="">Select an option</option>
-                      {field.enum.map((option) => (
-                        <option key={option} value={option}>
-                          {option}
-                        </option>
-                      ))}
-                    </Select>
-                  ) : canEdit && field.type === "boolean" ? (
-                    <label
-                      htmlFor={`review-${message.id}-${field.id}`}
-                      className="flex items-center gap-3 rounded-md border border-input bg-card px-3 py-2"
-                    >
-                      <input
-                        id={`review-${message.id}-${field.id}`}
-                        type="checkbox"
-                        checked={Boolean(value)}
-                        onChange={(event) => updateEditableValue(field.id, event.target.checked)}
-                        className="h-4 w-4 rounded border-input"
-                      />
-                      <span className="text-sm text-foreground">{Boolean(value) ? "True" : "False"}</span>
-                    </label>
-                  ) : canEdit && (field.type === "number" || field.type === "integer") ? (
-                    <Input
-                      id={`review-${message.id}-${field.id}`}
-                      type="number"
-                      value={typeof value === "number" && !Number.isNaN(value) ? value : ""}
-                      onChange={(event) => {
-                        const next = event.target.value;
-                        updateEditableValue(field.id, next === "" ? undefined : Number(next));
-                      }}
-                    />
-                  ) : canEdit && field.type === "array" ? (
-                    <Textarea
-                      id={`review-${message.id}-${field.id}`}
-                      value={Array.isArray(value) ? value.join(", ") : ""}
-                      onChange={(event) => {
-                        updateEditableValue(
-                          field.id,
-                          event.target.value
-                            .split(",")
-                            .map((item) => item.trim())
-                            .filter(Boolean)
-                        );
-                      }}
-                      placeholder="Enter comma-separated values"
-                    />
-                  ) : canEdit && field.type !== "object" ? (
-                    <Input
-                      id={`review-${message.id}-${field.id}`}
-                      value={typeof value === "string" ? value : formatFieldValue(value, field.type)}
-                      onChange={(event) => updateEditableValue(field.id, event.target.value)}
-                    />
-                  ) : (
-                    <pre className="whitespace-pre-wrap break-words rounded-md border border-border bg-card px-3 py-2 text-sm leading-6 [overflow-wrap:anywhere]">
-                      {formatFieldValue(value, field.type)}
-                    </pre>
-                  )}
-
-                  {field.description ? (
-                    <p className="text-xs text-muted-foreground">{field.description}</p>
-                  ) : null}
-                </div>
-              );
-            })}
-          </form>
-        </div>
-      )}
-      {requiresApproval && (
-        <div className="mt-4 flex items-center gap-3">
-          {decision === null ? (
-            <>
-              <button
-                type="button"
-                onClick={handleApprove}
-                className="inline-flex items-center gap-1.5 rounded-md bg-emerald-600 px-4 py-2 text-sm font-medium text-white shadow-sm transition hover:bg-emerald-700 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-emerald-600"
-              >
-                <CheckCircle2 className="h-4 w-4" />
-                Approve
-              </button>
-              <button
-                type="button"
-                onClick={handleReject}
-                className="inline-flex items-center gap-1.5 rounded-md border border-destructive bg-background px-4 py-2 text-sm font-medium text-destructive shadow-sm transition hover:bg-destructive/10 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-destructive"
-              >
-                <XCircle className="h-4 w-4" />
-                Reject
-              </button>
-              <button
-                type="button"
-                onClick={isEditing ? handleDoneEditing : handleModify}
-                disabled={!isEditing && !hasStructuredEditor}
-                className="inline-flex items-center gap-1.5 rounded-md border border-border bg-background px-4 py-2 text-sm font-medium text-foreground shadow-sm transition hover:bg-muted focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                <PencilLine className="h-4 w-4" />
-                {isEditing ? "Done" : "Modify"}
-              </button>
-            </>
-          ) : (
-            <span
-              className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm font-medium ${
-                decision === "approved"
-                  ? "bg-emerald-50 text-emerald-700 ring-1 ring-emerald-200"
-                  : "bg-red-50 text-red-700 ring-1 ring-red-200"
-              }`}
-            >
-              {decision === "approved" ? (
-                <CheckCircle2 className="h-4 w-4" />
-              ) : (
-                <XCircle className="h-4 w-4" />
-              )}
-              {decision === "approved" ? "Approved — proceeding to execution" : "Rejected — provisioning cancelled"}
-            </span>
-          )}
-        </div>
-      )}
-    </>
-  );
-
-  if (isWideLayout || requiresApproval) {
-    return (
-      <article className="flex gap-3">
-        <div className="mt-1 flex h-10 w-10 shrink-0 items-center justify-center rounded-md border border-border bg-card text-primary">
-          <Bot className="h-6 w-6" />
-        </div>
-        <div className="w-full max-w-3xl rounded-lg border border-border bg-card px-4 py-3 text-sm leading-6 shadow-sm">
-          {content}
-        </div>
-      </article>
-    );
-  }
+  useEffect(() => {
+    endRef.current?.scrollIntoView({ block: "end" });
+  }, [messages]);
 
   return (
-    <article className="flex gap-3">
-      <div className="mt-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-border bg-card text-primary">
-        <Bot className="h-5 w-5" />
+    <div className="h-full overflow-y-auto px-4 pb-6 pt-16 scrollbar-subtle lg:pt-10">
+      <div className="mx-auto flex w-full max-w-4xl flex-col gap-5">
+        {messages.map((message, index) => {
+          const reviewEditableConfig =
+            message.kind === "text" &&
+            message.role === "assistant" &&
+            message.metadata?.requiresApproval === true
+              ? getReviewEditableConfig(messages, index)
+              : undefined;
+
+          return (
+            <MessageRenderer
+              key={message.id}
+              message={message}
+              onFormSubmit={onFormSubmit}
+              onA2UIFormSubmit={onA2UIFormSubmit}
+              onSendMessage={onSendMessage}
+              reviewEditableConfig={reviewEditableConfig}
+            />
+          );
+        })}
+        <div ref={endRef} />
       </div>
-      <div className="max-w-[min(760px,90%)] rounded-lg border border-border bg-card px-4 py-3 text-sm leading-6 shadow-sm">
-        {content}
-      </div>
-    </article>
+    </div>
   );
 }
