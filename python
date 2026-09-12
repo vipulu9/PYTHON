@@ -1,269 +1,91 @@
-import { useEffect, useRef } from "react";
-
-import { MessageRenderer } from "@/components/chat/MessageRenderer";
-import type { ReviewEditableConfig } from "@/components/chat/MessageRenderer";
-import type { CatalogItemId } from "@/types/catalog";
+import { AssistantMessage } from "@/components/chat/messages/AssistantMessage";
 import {
-  createDnnParameters,
-  getCreateDnnRequiredFields,
-  provisioningFormDefinitions,
-  type CreateDnnFormValues
-} from "@/types/forms";
+  A2UIDynamicFormMessageView,
+  NotificationMessageView,
+  StatusCardMessageView,
+  TableMessageView,
+  WorkflowProgressMessageView
+} from "@/components/chat/messages/FutureMessages";
+import { FormMessage } from "@/components/chat/messages/FormMessage";
+import { SystemMessage } from "@/components/chat/messages/SystemMessage";
+import { UserMessage } from "@/components/chat/messages/UserMessage";
 import type { ProvisioningFormValues } from "@/types/forms";
-import type { A2UIDynamicFormMessage, ChatMessage, FormMessage } from "@/types/message";
+import type {
+  A2UIDynamicFormMessage,
+  ChatMessage,
+  FormMessage as FormMessageType
+} from "@/types/message";
 
-interface MessageListProps {
-  messages: ChatMessage[];
-  onFormSubmit: (message: FormMessage, values: ProvisioningFormValues) => void;
+export interface ReviewEditableProperty {
+  type: "string" | "number" | "integer" | "boolean" | "array" | "object";
+  label: string;
+  description?: string;
+  enum?: string[];
+  readOnly?: boolean;
+  hidden?: boolean;
+}
+
+export interface ReviewEditableConfig {
+  values: Record<string, unknown>;
+  required: string[];
+  properties: Record<string, ReviewEditableProperty>;
+}
+
+interface MessageRendererProps {
+  message: ChatMessage;
+  onFormSubmit: (
+    message: FormMessageType,
+    values: ProvisioningFormValues
+  ) => void;
   onA2UIFormSubmit: (message: A2UIDynamicFormMessage, values: Record<string, unknown>) => void;
   onSendMessage?: (content: string) => void;
+  reviewEditableConfig?: ReviewEditableConfig;
 }
 
-const REVIEW_HIDDEN_FIELDS = ["operation", "detected_ip_modes", "ipAllocationMode"];
-const REVIEW_READ_ONLY_FIELDS = [
-  "scenario",
-  "radius",
-  "account",
-  "customer_address",
-  "dnn_name",
-  "servicename",
-  "epg1",
-  "smf1"
-];
-
-function normalizeReviewFieldKey(value: string): string {
-  return value.toLowerCase().replace(/[^a-z0-9]/g, "");
-}
-
-const hiddenFieldLookup = new Set(REVIEW_HIDDEN_FIELDS.map(normalizeReviewFieldKey));
-const readOnlyFieldLookup = new Set(REVIEW_READ_ONLY_FIELDS.map(normalizeReviewFieldKey));
-
-function inferValueType(value: unknown): "string" | "number" | "integer" | "boolean" | "array" | "object" {
-  if (typeof value === "boolean") {
-    return "boolean";
-  }
-
-  if (typeof value === "number") {
-    return Number.isInteger(value) ? "integer" : "number";
-  }
-
-  if (Array.isArray(value)) {
-    return "array";
-  }
-
-  if (value && typeof value === "object") {
-    return "object";
-  }
-
-  return "string";
-}
-
-function applyReviewFieldAccessRules(config: ReviewEditableConfig): ReviewEditableConfig {
-  const nextProperties = Object.entries(config.properties).reduce<ReviewEditableConfig["properties"]>((acc, [key, property]) => {
-    const normalizedKey = normalizeReviewFieldKey(key);
-
-    acc[key] = {
-      ...property,
-      hidden: hiddenFieldLookup.has(normalizedKey),
-      readOnly: property.readOnly === true || readOnlyFieldLookup.has(normalizedKey)
-    };
-
-    return acc;
-  }, {});
-
-  return {
-    ...config,
-    properties: nextProperties
-  };
-}
-
-function buildFromA2UI(message: A2UIDynamicFormMessage): ReviewEditableConfig | null {
-  const schema = message.schema as {
-    required?: string[];
-    properties?: Record<string, {
-      type?: string;
-      title?: string;
-      description?: string;
-      enum?: string[];
-      readOnly?: boolean;
-    }>;
-  };
-  const values = message.data;
-
-  if (!values || typeof values !== "object") {
-    return null;
-  }
-
-  const properties = schema.properties ?? {};
-  const configuredFields = Object.keys(properties);
-  const valueFields = Object.keys(values);
-  const allFields = Array.from(new Set([...configuredFields, ...valueFields]));
-
-  const mappedProperties = allFields.reduce<ReviewEditableConfig["properties"]>((acc, key) => {
-    const def = properties[key];
-    const valueType = inferValueType(values[key]);
-    const schemaType = def?.type;
-
-    acc[key] = {
-      type:
-        schemaType === "boolean" ||
-        schemaType === "number" ||
-        schemaType === "integer" ||
-        schemaType === "array"
-          ? schemaType
-          : schemaType === "object"
-            ? "object"
-            : valueType,
-      label: def?.title ?? key,
-      description: def?.description,
-      enum: Array.isArray(def?.enum) ? def?.enum : undefined,
-      readOnly: def?.readOnly === true
-    };
-
-    return acc;
-  }, {});
-
-  return {
-    values,
-    required: schema.required ?? [],
-    properties: mappedProperties
-  };
-}
-
-function buildFromCatalogSubmission(message: ChatMessage): ReviewEditableConfig | null {
-  if (message.kind !== "text" || message.role !== "user") {
-    return null;
-  }
-
-  if (message.metadata?.source !== "catalog-form") {
-    return null;
-  }
-
-  const payload = message.structuredData;
-  if (!payload || typeof payload !== "object") {
-    return null;
-  }
-
-  const catalogIdRaw = payload.catalogId;
-  const valuesRaw = payload.values;
-
-  if (
-    (catalogIdRaw !== "create-dnn" && catalogIdRaw !== "modify-dnn" && catalogIdRaw !== "delete-dnn") ||
-    !valuesRaw ||
-    typeof valuesRaw !== "object"
-  ) {
-    return null;
-  }
-
-  const catalogId = catalogIdRaw as CatalogItemId;
-  const values = valuesRaw as Record<string, unknown>;
-  const valueKeys = Object.keys(values);
-
-  if (catalogId === "create-dnn") {
-    const definitionByName = new Map(createDnnParameters.map((field) => [field.name, field]));
-    const requiredSet = new Set(getCreateDnnRequiredFields(values as CreateDnnFormValues));
-
-    const properties = valueKeys.reduce<ReviewEditableConfig["properties"]>((acc, key) => {
-      const def = definitionByName.get(key);
-      acc[key] = {
-        type: def?.type ?? inferValueType(values[key]),
-        label: key,
-        description: def?.description,
-        enum: def?.enum
-      };
-      return acc;
-    }, {});
-
-    return {
-      values,
-      required: valueKeys.filter((key) => requiredSet.has(key)),
-      properties
-    };
-  }
-
-  const definition = provisioningFormDefinitions[catalogId];
-  const formFieldMap = new Map(definition.fields.map((field) => [field.name, field]));
-
-  const properties = valueKeys.reduce<ReviewEditableConfig["properties"]>((acc, key) => {
-    const field = formFieldMap.get(key);
-    let type = inferValueType(values[key]);
-
-    if (field?.type === "select") {
-      type = "string";
-    }
-
-    acc[key] = {
-      type,
-      label: field?.label ?? key,
-      description: field?.placeholder,
-      enum: field?.options?.map((option) => option.value)
-    };
-    return acc;
-  }, {});
-
-  return {
-    values,
-    required: definition.fields.filter((field) => field.required).map((field) => field.name),
-    properties
-  };
-}
-
-function getReviewEditableConfig(messages: ChatMessage[], currentIndex: number): ReviewEditableConfig | undefined {
-  for (let index = currentIndex - 1; index >= 0; index -= 1) {
-    const candidate = messages[index];
-
-    if (candidate.kind === "a2ui-form" && candidate.metadata?.status === "submitted") {
-      const fromA2UI = buildFromA2UI(candidate);
-      if (fromA2UI) {
-        return applyReviewFieldAccessRules(fromA2UI);
-      }
-    }
-
-    const fromCatalog = buildFromCatalogSubmission(candidate);
-    if (fromCatalog) {
-      return applyReviewFieldAccessRules(fromCatalog);
-    }
-  }
-
-  return undefined;
-}
-
-export function MessageList({
-  messages,
+export function MessageRenderer({
+  message,
   onFormSubmit,
   onA2UIFormSubmit,
-  onSendMessage
-}: MessageListProps) {
-  const endRef = useRef<HTMLDivElement | null>(null);
+  onSendMessage,
+  reviewEditableConfig
+}: MessageRendererProps) {
+  if (message.kind === "form") {
+    return <FormMessage message={message} onSubmit={onFormSubmit} />;
+  }
 
-  useEffect(() => {
-    endRef.current?.scrollIntoView({ block: "end" });
-  }, [messages]);
+  if (message.kind === "status-card") {
+    return <StatusCardMessageView message={message} />;
+  }
+
+  if (message.kind === "notification") {
+    return <NotificationMessageView message={message} />;
+  }
+
+  if (message.kind === "table") {
+    return <TableMessageView message={message} />;
+  }
+
+  if (message.kind === "a2ui-form") {
+    return <A2UIDynamicFormMessageView message={message} onSubmit={onA2UIFormSubmit} />;
+  }
+
+  if (message.kind === "workflow-progress") {
+    return <WorkflowProgressMessageView message={message} />;
+  }
+
+  if (message.role === "user") {
+    return <UserMessage message={message} />;
+  }
+
+  if (message.role === "system") {
+    return <SystemMessage message={message} />;
+  }
 
   return (
-    <div className="h-full overflow-y-auto px-4 pb-6 pt-16 scrollbar-subtle lg:pt-10">
-      <div className="mx-auto flex w-full max-w-4xl flex-col gap-5">
-        {messages.map((message, index) => {
-          const reviewEditableConfig =
-            message.kind === "text" &&
-            message.role === "assistant" &&
-            message.metadata?.requiresApproval === true
-              ? getReviewEditableConfig(messages, index)
-              : undefined;
-
-          return (
-            <MessageRenderer
-              key={message.id}
-              message={message}
-              onFormSubmit={onFormSubmit}
-              onA2UIFormSubmit={onA2UIFormSubmit}
-              onSendMessage={onSendMessage}
-              reviewEditableConfig={reviewEditableConfig}
-            />
-          );
-        })}
-        <div ref={endRef} />
-      </div>
-    </div>
+    <AssistantMessage
+      message={message}
+      onSendMessage={onSendMessage}
+      reviewEditableConfig={reviewEditableConfig}
+    />
   );
 }
